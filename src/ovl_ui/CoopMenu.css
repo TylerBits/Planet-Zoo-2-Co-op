@@ -1,0 +1,191 @@
+/* PZ2-Coop co-op screen (UIGameface/css/project/components/PZ2Coop/CoopMenu.css).
+   Layout only: panel, buttons, scroll bar and fonts come from the game's own components and variables. */
+.SpecialModal_root.CoopMenu_root {
+  width: 44rem;
+  height: 50rem;
+}
+/* One scroll area (vanilla ScrollPane: mouse wheel + scroll bar), footer stays visible below it. */
+.CoopMenu_scroll {
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  min-height: 0;
+}
+.CoopMenu_body {
+  display: flex;
+  flex-direction: column;
+  padding: 1.1111111111rem 1.6666666667rem 1.1111111111rem;
+  color: var(--brown);
+  font-family: StandardFont, StandardFont_fallback1, StandardFont_fallback2, StandardFont_fallback3, StandardFont_fallback4, StandardFont_fallback5, StandardFont_fallback6, StandardFont_fallback7;
+}
+.CoopMenu_footer {
+  flex: 0 0 auto;
+  padding: 0.8333333333rem 1.6666666667rem 1.1111111111rem;
+  border-top: 0.0555555556rem solid var(--whiteBrown20);
+}
+
+/* status pill */
+.CoopMenu_status {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  min-height: 3.3333333333rem;
+  margin-bottom: 0.8333333333rem;
+  padding: 0.5555555556rem 0.8333333333rem;
+  border-radius: 1.6666666667rem;
+  background-color: var(--whiteBrown10);
+  border: 0.1111111111rem solid var(--whiteBrown30);
+}
+.CoopMenu_status.live {
+  background-color: var(--green);
+  border-color: var(--greenDark);
+  color: var(--white);
+}
+.CoopMenu_status > * + * {
+  margin-left: 0.6666666667rem;
+}
+.CoopMenu_statusIcon {
+  flex: 0 0 auto;
+  width: 1.7777777778rem;
+  height: 1.7777777778rem;
+  filter: var(--brown-filter);
+}
+.CoopMenu_status.live .CoopMenu_statusIcon {
+  filter: var(--white-filter);
+}
+.CoopMenu_statusText {
+  flex: 1 1 auto;
+  font-size: 1.2222222222rem;
+  font-weight: bold;
+}
+.CoopMenu_spinner {
+  flex: 0 0 auto;
+  width: 1.6666666667rem;
+  height: 1.6666666667rem;
+}
+.CoopMenu_error {
+  margin-bottom: 0.8333333333rem;
+  color: var(--negative);
+  font-size: 1.1111111111rem;
+}
+
+/* sections */
+.CoopMenu_section {
+  display: flex;
+  flex-direction: column;
+}
+.CoopMenu_section > * + * {
+  margin-top: 0.5555555556rem;
+}
+.CoopMenu_sectionTitle {
+  margin-top: 0.5555555556rem;
+  font-size: 1rem;
+  font-weight: bold;
+  text-transform: uppercase;
+  letter-spacing: 0.0555555556rem;
+  color: var(--greenDark);
+}
+.CoopMenu_hint {
+  font-size: 1rem;
+  color: var(--brown);
+  opacity: 0.75;
+}
+
+/* rows */
+.CoopMenu_row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  min-height: 2.7777777778rem;
+}
+.CoopMenu_row > * + * {
+  margin-left: 0.8333333333rem;
+}
+.CoopMenu_rowText {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.CoopMenu_name {
+  font-size: 1.2222222222rem;
+  font-weight: bold;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.CoopMenu_detail {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  font-size: 0.9444444444rem;
+  opacity: 0.8;
+}
+.CoopMenu_dot {
+  width: 0.5555555556rem;
+  height: 0.5555555556rem;
+  margin-right: 0.3888888889rem;
+  border-radius: 50%;
+  background-color: var(--grey);
+}
+.CoopMenu_dot.playing {
+  background-color: var(--positive);
+}
+
+/* Steam pictures */
+.CoopMenu_avatar {
+  position: relative;
+  flex: 0 0 auto;
+  width: 2.6666666667rem;
+  height: 2.6666666667rem;
+  border-radius: 50%;
+  overflow: hidden;
+  background-color: var(--greenDark);
+  border: 0.1111111111rem solid var(--whiteBrown30);
+}
+.CoopMenu_avatar.free {
+  background-color: var(--whiteBrown10);
+  border-style: dashed;
+}
+.CoopMenu_avatarCanvas {
+  width: 100%;
+  height: 100%;
+}
+.CoopMenu_avatarInitial {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  font-size: 1.2222222222rem;
+  font-weight: bold;
+  color: var(--white);
+}
+.CoopMenu_avatar.free .CoopMenu_avatarInitial {
+  color: var(--brown);
+}
+
+/* room code */
+.CoopMenu_code {
+  flex: 1 1 auto;
+  font-size: 2rem;
+  font-weight: bold;
+  letter-spacing: 0.1111111111rem;
+  color: var(--greenDark);
+}
+.CoopMenu_codeInput,
+.CoopMenu_search {
+  flex: 1 1 auto;
+}
+
+/* "Who can join": two equal buttons, the selected one solid green with a tick, the other white */
+.CoopMenu_segmented {
+  display: flex;
+  flex-direction: row;
+}
+.CoopMenu_segment {
+  flex: 1 1 0;
+}
+.CoopMenu_segmented > * + * {
+  margin-left: 0.5555555556rem;
+}

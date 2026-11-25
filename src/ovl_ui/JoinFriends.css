@@ -1,0 +1,145 @@
+/* PZ2-Coop main menu Join Friends card + popup (UIGameface/css/project/components/PZ2Coop/JoinFriends.css).
+   This file loads before HomeButtons.css (ES imports run first), so overrides of vanilla rules use a
+   more specific selector than the rule they change.
+   Row 1 width math (HomeButtons_root is 38.8888888889rem, gap 0.5555555556rem as between Franchise and
+   Sandbox): My Saves 11.1111 + Join Friends 11.1111 + 2 gaps = 23.3333, Resume takes the remaining
+   15.5556rem (40%), so the row ends flush with Career / Sandbox. */
+
+/* ---- Resume: narrower, same height, no wide date overlay ---- */
+.HomeButtons_buttonsHBox .HomeResumeButton_root {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.HomeButtons_buttonsHBox .HomeResumeButton_button {
+  width: auto;
+  min-width: 0;
+  margin-right: 0;
+}
+.HomeButtons_buttonsHBox .HomeResumeButton_labelsBox {
+  display: none;
+}
+.HomeButtons_buttonsHBox .HomeResumeButton_button .ImageButton_subLabel {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---- Join Friends card: same box as My Saves ---- */
+.JoinFriends_card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 11.1111111111rem;
+  width: 11.1111111111rem;
+}
+/* No Resume save: the card takes Resume's space so the row still ends flush right. */
+.JoinFriends_card.fill {
+  flex: 1 1 0;
+  width: auto;
+  min-width: 0;
+}
+.ImageButton_root.HomeButtons_button.joinFriends {
+  height: 11.1111111111rem;
+  align-self: stretch;
+}
+/* Muted deep teal, between the menu's olive and the Sandbox tile's blue-green. */
+.ImageButton_imageContainer.joinFriends {
+  background-color: #2f6a78;
+}
+.ImageButton_imageContainer.joinFriends.hover,
+.ImageButton_imageContainer.joinFriends.focused {
+  background-color: #387b8a;
+}
+.ImageButton_imageContainer.joinFriends.down {
+  background-color: #275966;
+}
+.ImageButton_imageContainer.joinFriends.disabled {
+  background-color: #4b6268;
+}
+
+/* Two people + join arrow, white like the My Saves floppy, centred above the torn-paper footer. */
+.JoinFriends_glyph {
+  position: absolute;
+  left: 0rem;
+  right: 0rem;
+  top: 0rem;
+  bottom: 2.2222222222rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+.JoinFriends_glyphPeople {
+  position: relative;
+  width: 4.6666666667rem;
+  height: 4.6666666667rem;
+  filter: var(--white-filter);
+}
+.JoinFriends_glyphArrow {
+  position: absolute;
+  width: 1.7777777778rem;
+  height: 1.7777777778rem;
+  margin-left: 4.2222222222rem;
+  margin-top: 2.6666666667rem;
+  filter: var(--white-filter);
+}
+
+/* Status pill, top right */
+.JoinFriends_pill {
+  position: absolute;
+  top: 0.4444444444rem;
+  right: 0.4444444444rem;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  padding: 0.1666666667rem 0.5555555556rem;
+  border-radius: 0.8888888889rem;
+  background-color: rgba(20, 28, 26, 0.6);
+  color: var(--white);
+  font-family: StandardFont, StandardFont_fallback1, StandardFont_fallback2, StandardFont_fallback3, StandardFont_fallback4, StandardFont_fallback5, StandardFont_fallback6, StandardFont_fallback7;
+  font-size: 0.8888888889rem;
+  font-weight: bold;
+  white-space: nowrap;
+  opacity: 0.75;
+  pointer-events: none;
+}
+.JoinFriends_pill.live {
+  opacity: 1;
+}
+.JoinFriends_pillDot {
+  width: 0.5555555556rem;
+  height: 0.5555555556rem;
+  margin-right: 0.3333333333rem;
+  border-radius: 50%;
+  background-color: var(--grey);
+}
+.JoinFriends_pill.live .JoinFriends_pillDot {
+  background-color: var(--positive);
+}
+
+/* ---- Popup: panel, rows, status and buttons come from SpecialModal + CoopMenu.css ---- */
+.SpecialModal_root.JoinFriends_modal {
+  width: 40rem;
+  height: 44rem;
+}
+.JoinFriends_footer {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+}
+.JoinFriends_footer > * + * {
+  margin-left: 0.5555555556rem;
+}
+.JoinFriends_empty {
+  display: flex;
+  flex-direction: column;
+  padding: 0.8333333333rem 0rem;
+}
+.JoinFriends_emptyTitle {
+  font-size: 1.2222222222rem;
+  font-weight: bold;
+  margin-bottom: 0.2777777778rem;
+}
+.CoopMenu_row.JoinFriends_muted {
+  opacity: 0.6;
+}

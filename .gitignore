@@ -1,0 +1,53 @@
+# Frontier-derived files: never commit
+decompiled_lua/
+extracted/
+*.ovl
+*.ppuipkg
+
+# Build & release output
+build/
+dist/
+__pycache__/
+*.py[cod]
+
+# Runtime / crash artefacts
+*.dmp
+diag*.log
+
+# Local external tooling (downloaded / cloned on dev machine)
+tools/cmake/
+tools/cmake_partial/
+tools/cobra-tools/
+tools/unluac.jar
+
+# Secrets, environment files & local credentials: never commit
+.env
+.env.*
+*.pem
+*.key
+*secret*
+*webhook*
+
+# Personal workflow, Discord/showcase pipeline, brand kits & internal planning notes
+AGENTS.md
+CLAUDE.md
+docs/HANDOFF.md
+docs/MEGA_TEST.md
+docs/RELEASE_CHECKLIST.md
+docs/AAA_AVATAR_LOCOMOTION_PLAN.md
+docs/PLAYER_NPC_ACTIVITIES_PLAN.md
+docs/THIRD_PERSON.md
+docs/brand/
+docs/nexus/
+assets/brand/
+tools/record_showcase.py
+tools/render_showcase.py
+tools/run_showcase_pipeline.ps1
+tools/inspect_clip.py
+tools/slice_discord_assets.py
+
+# Editor & OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
