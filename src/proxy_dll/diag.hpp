@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string_view>
 
 namespace pz2 {
@@ -19,5 +20,6 @@ void diagLog(std::string_view text);
 // Points PlanetZoo2.exe's import of <dll>!<function> at hook. original (if still null) is set to the old target
 // BEFORE the slot is switched, so a game thread entering the hook mid-patch never sees null. Stays null if not imported.
 void patchExeImport(const char* dll, const char* function, void* hook, void*& original);
+void patchExeImportByOrdinal(const char* dll, std::uint16_t ordinal, void* hook, void*& original);
 
 } // namespace pz2

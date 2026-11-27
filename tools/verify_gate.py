@@ -6,10 +6,15 @@ Single source of truth for "was this mod code verified in the live game?":
   compute_test_hash(root)  SHA-256 over the live autotest driver and runner.
   build/verify_stamp.json  written ONLY by tools/test_live_game.py after an ALL PASSED run whose AUTOTEST_META
                            run_id and build_hash matched this workspace (see write_stamp / check_run_meta).
+                           Never for a hot run (META hot=1: --warm, --case or --hot-logic).
+  build/offline_stamp.json written ONLY by tools/run_all_tests.py after ALL PASSED for this workspace. Accepted
+                           instead of a live PASS only while the live plan cannot run on this machine (game or
+                           live fixtures missing, see live_blocker); the reply must still say it is unverified.
 
 Usage:
   python tools/verify_gate.py               Stop hook: exit 0 = allow, exit 2 = block (reason on stderr, <= 3 lines)
-  python tools/verify_gate.py --baseline    SessionStart hook: fallback per-file baseline, used only without git
+  python tools/verify_gate.py --baseline    SessionStart hook: records production files already dirty for this
+                                            session id (build/verify_sessions/); per-file baseline without git
   python tools/verify_gate.py --guard-stamp PreToolUse hook: blocks Edit/Write calls on build/verify_stamp.json
 
 Dirty detection is git-anchored (changes against HEAD, untracked included), so a session restart never hides
@@ -30,8 +35,10 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 STAMP_REL = "build/verify_stamp.json"
+OFFLINE_STAMP_REL = "build/offline_stamp.json"
 BASELINE_REL = "build/verify_baseline.json"
 COUNTER_REL = "build/verify_gate_blocks.txt"
+SESSIONS_REL = "build/verify_sessions"  # per-session list of production files already dirty at SessionStart
 MAX_CONSECUTIVE_BLOCKS = 2
 GENERATED_META = "pz2coop.build_meta.lua"
 
@@ -40,6 +47,15 @@ PLAN_RULES = {
     "src/ovl_mod/pz2coop.buildsync.lua": ["mirror_place"],
     "*": ["mirror_place"],
 }
+
+# Files a live plan needs in <game>/PZ2Coop: (fixture, sources test_live_game.py may copy it from).
+# Every fixture a run uses is also kept in FIXTURE_BACKUP_REL and restored from there when missing
+# (build_ovl_mod.py --uninstall deletes the whole <game>/PZ2Coop folder). test_path.bin is made with
+# python tools/test_live_game.py --save-path-fixture.
+LIVE_FIXTURES = {
+    "mirror_place": (("test_path.bin", ()), ("test_aquarium.bin", ("clip_12.bin",))),
+}
+FIXTURE_BACKUP_REL = "build/fixtures"
 
 PROXY_SUFFIXES = {".cpp", ".hpp", ".h", ".c", ".cc", ".def", ".rc", ".cmake", ".manifest"}
 TEST_FILES = ("src/ovl_mod/pz2coop.autotest.lua", "tools/test_live_game.py")
@@ -52,7 +68,7 @@ def is_production(rel: str) -> bool:
         return True
     if rel.startswith("src/ovl_mod/") and rel.endswith(".lua"):
         name = rel.rsplit("/", 1)[-1]
-        return not name.endswith(".autotest.lua") and name != GENERATED_META
+        return not name.endswith(".autotest.lua") and not name.startswith("pz2coop.at_") and name != GENERATED_META
     if rel.startswith("src/proxy_dll/"):
         parts = rel.split("/")
         if any(p in ("build", "out", "x64", "Release", "Debug") for p in parts[2:-1]):
@@ -90,7 +106,11 @@ def compute_mod_hash(root: pathlib.Path = ROOT) -> str:
 
 
 def compute_test_hash(root: pathlib.Path = ROOT) -> str:
-    return _hash_files(root, [r for r in TEST_FILES if (root / r).is_file()])
+    rels = [r for r in TEST_FILES if (root / r).is_file()]
+    ovl_dir = root / "src" / "ovl_mod"
+    if ovl_dir.is_dir():
+        rels += sorted(p.relative_to(root).as_posix() for p in ovl_dir.glob("pz2coop.at_*.lua") if p.is_file())
+    return _hash_files(root, sorted(set(rels)))
 
 
 # ---- dirty detection -------------------------------------------------------------------------------------
@@ -136,6 +156,44 @@ def dirty_production_files(root: pathlib.Path = ROOT) -> list[str]:
         return production_files(root) or ["<no git and no baseline>"]  # fail closed
     now = {r: file_digest(root, r) for r in production_files(root)}
     return sorted(r for r in set(base) | set(now) if base.get(r) != now.get(r))
+
+
+def _digest_or_gone(root: pathlib.Path, rel: str) -> str:
+    return file_digest(root, rel) if (root / rel).is_file() else "<deleted>"
+
+
+def session_baseline_path(root: pathlib.Path, session_id: object) -> pathlib.Path | None:
+    sid = re.sub(r"[^A-Za-z0-9-]", "", session_id) if isinstance(session_id, str) else ""
+    return root / SESSIONS_REL / f"{sid}.json" if sid else None
+
+
+def write_session_baseline(root: pathlib.Path, session_id: object) -> list[str]:
+    """SessionStart: remember production files that are already dirty (another session's work). Written once per
+    session id, so compact/resume keeps the original. Returns those files."""
+    path = session_baseline_path(root, session_id)
+    if path is None:
+        return []
+    if not path.is_file():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({r: _digest_or_gone(root, r) for r in dirty_production_files(root)}, indent=1),
+                        encoding="utf-8")
+    try:
+        return sorted(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return []
+
+
+def session_dirty_files(root: pathlib.Path, session_id: object) -> list[str]:
+    """Dirty production files minus those unchanged since this session started. No baseline: all (fail closed)."""
+    dirty = dirty_production_files(root)
+    path = session_baseline_path(root, session_id)
+    try:
+        base = json.loads(path.read_text(encoding="utf-8")) if path else None
+    except (OSError, ValueError):
+        base = None
+    if not isinstance(base, dict):
+        return dirty
+    return [r for r in dirty if base.get(r) != _digest_or_gone(root, r)]
 
 
 def required_plans(dirty: list[str]) -> list[str]:
@@ -186,6 +244,8 @@ def write_stamp(root: pathlib.Path, plan: str, run_id: str, meta: dict | None, a
     """Writes/merges the stamp. Returns None when written, else why it was refused (stamp left untouched)."""
     if not all_ok:
         return "run failed"
+    if (meta or {}).get("hot") == "1":
+        return "hot run (--warm/--case/--hot-logic): only a clean cold install + full plan run writes the stamp"
     problem = check_run_meta(root, meta, run_id)
     if problem:
         return problem
@@ -204,6 +264,42 @@ def write_stamp(root: pathlib.Path, plan: str, run_id: str, meta: dict | None, a
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }, indent=2), encoding="utf-8")
     return None
+
+
+# ---- offline fallback -------------------------------------------------------------------------------------
+def live_blocker(plans: list[str], game_dir: pathlib.Path | None = None,
+                 backup_dir: pathlib.Path | None = None) -> str | None:
+    """Why the live plans cannot run on this machine, or None when they can (then only a live PASS counts)."""
+    backup = backup_dir if backup_dir is not None else ROOT / FIXTURE_BACKUP_REL
+    if game_dir is None:
+        try:
+            sys.path.insert(0, str(ROOT / "tools"))
+            from extract_all_lua import find_game_dir
+            game_dir = find_game_dir()
+        except Exception:  # noqa: BLE001 - no Steam/registry: treat as no game
+            game_dir = None
+    if game_dir is None:
+        return "game not installed"
+    coop = pathlib.Path(game_dir) / "PZ2Coop"
+    missing = [fixture for plan in plans for fixture, sources in LIVE_FIXTURES.get(plan, ())
+               if not any((coop / n).is_file() for n in (fixture, *sources)) and not (backup / fixture).is_file()]
+    return f"live fixture(s) missing in {coop}: {', '.join(missing)}" if missing else None
+
+
+def write_offline_stamp(root: pathlib.Path) -> None:
+    path = root / OFFLINE_STAMP_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"mod_hash": compute_mod_hash(root),
+                                "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, indent=2),
+                    encoding="utf-8")
+
+
+def offline_stamp_ok(root: pathlib.Path) -> bool:
+    try:
+        stamp = json.loads((root / OFFLINE_STAMP_REL).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(stamp, dict) and stamp.get("mod_hash") == compute_mod_hash(root)
 
 
 # ---- Stop hook -------------------------------------------------------------------------------------------
@@ -239,7 +335,8 @@ def honest_disclaimer(msg: str) -> bool:
     """The reply admits it is unverified and does not claim "fixed" without a quoted live PASS line."""
     if "NOT verified in game" not in msg:
         return False
-    claims = re.sub(r"(?i)\b(not|never|isn't|wasn't|un)\s*(yet\s+)?fixed\b", "", msg)
+    claims = re.sub(r"(?i)\b(not|never|isn't|wasn't|un|nothing(\s+(is|was))?)\s*(yet\s+)?fixed\b", "", msg)
+    claims = re.sub(r"(?i)[\"'`“‘]fixed[\"'`”’]", "", claims)  # the word quoted, e.g. while explaining the gate
     claims_fixed = re.search(r"(?i)\bfixed\b", claims) is not None
     return not claims_fixed or re.search(r"AUTOTEST_CHECK \S+ PASS", msg) is not None
 
@@ -261,7 +358,8 @@ def _counter(root: pathlib.Path, value: int | None = None) -> int:
 
 def gate(root: pathlib.Path, payload: dict) -> tuple[int, str]:
     """(exit code, stderr message). 0 = allow stop, 2 = block."""
-    dirty = dirty_production_files(root)
+    # Only this session's edits count: files another session left dirty are its own Stop hook's job.
+    dirty = session_dirty_files(root, payload.get("session_id"))
     if not dirty:
         _counter(root, 0)
         return 0, ""
@@ -269,12 +367,19 @@ def gate(root: pathlib.Path, payload: dict) -> tuple[int, str]:
     if stamp_problem(root, plans) is None:
         _counter(root, 0)
         return 0, ""
-    if payload.get("stop_hook_active") is True:
-        if honest_disclaimer(final_message(payload)) or _counter(root) >= MAX_CONSECUTIVE_BLOCKS:
-            _counter(root, 0)
-            return 0, ""
-    _counter(root, _counter(root) + 1)
     p = ",".join(plans)
+    if offline_stamp_ok(root):
+        blocker = live_blocker(plans)
+        if blocker is not None:
+            _counter(root, 0)
+            return 0, (f"verify_gate: offline tests passed; live plan(s) {p} cannot run here ({blocker}). "
+                       "Offline only, NOT verified in game.")
+    # An honest "NOT verified in game" reply passes on the first stop; the cap only ends a block loop.
+    capped = payload.get("stop_hook_active") is True and _counter(root) >= MAX_CONSECUTIVE_BLOCKS
+    if honest_disclaimer(final_message(payload)) or capped:
+        _counter(root, 0)
+        return 0, ""
+    _counter(root, _counter(root) + 1)
     return 2, (f"BLOCKED: Mod code changed without live PASS for plan(s): {p}.\n"
                f"Run: python tools/build_ovl_mod.py --install && python tools/test_live_game.py --plan {p}\n"
                "Do not claim fixed.")
@@ -289,11 +394,13 @@ def guard_stamp(root: pathlib.Path, payload: dict) -> tuple[int, str]:
     if not path.is_absolute():
         path = root / path
     try:
-        hit = path.resolve() == (root / STAMP_REL).resolve()
+        resolved = path.resolve()
+        hit = resolved in ((root / STAMP_REL).resolve(), (root / OFFLINE_STAMP_REL).resolve())
     except OSError:
-        hit = path.name == "verify_stamp.json"
+        hit = path.name in ("verify_stamp.json", "offline_stamp.json")
     if hit:
-        return 2, "BLOCKED: build/verify_stamp.json is written only by tools/test_live_game.py."
+        return 2, ("BLOCKED: build/verify_stamp.json / offline_stamp.json are written only by "
+                   "tools/test_live_game.py / tools/run_all_tests.py.")
     return 0, ""
 
 
@@ -313,11 +420,14 @@ def main() -> int:
     group.add_argument("--baseline", action="store_true")
     group.add_argument("--guard-stamp", action="store_true")
     args = parser.parse_args()
+    payload = read_payload()
     if args.baseline:
         if git_changed(ROOT) is None:
             write_baseline(ROOT)
+        elif write_session_baseline(ROOT, payload.get("session_id")):
+            print("verify_gate: production files already uncommitted at session start (not this session's edits; "
+                  "the gate ignores them unless they change again).")
         return 0
-    payload = read_payload()
     code, msg = guard_stamp(ROOT, payload) if args.guard_stamp else gate(ROOT, payload)
     if msg:
         print(msg, file=sys.stderr)

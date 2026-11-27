@@ -229,6 +229,23 @@ pAq.d.ox = 5000
 WaterSync.OnPacket({nType = 0x22, tData = pAq.d})
 tick(10)
 assert(count("FillAquarium") == 1 and lastCall("FillAquarium").args[1] == 700, "FillAquarium not called:\n" .. dump())
+
+-- 8) a premade blueprint's aquarium water travels inside the blueprint (BuildSync k = "bp"): learned, not sent;
+--    a lake added after the window is still sent
+tick(30)
+local nPk = #packets
+local mo = {GetTransform = function() return {GetPosition = function() return vec(40, 2, 10) end,
+  GetOrientation = function() return {ToYawPitchRoll = function() return vec(0, 0, 0) end} end} end}
+BuildSync.NotePremadeCommit({blueprintID = 42}, mo)
+lakes[120] = {fill = vec(40.0, 2.0, 10.0), props = lakes[1].props}
+fireLakeUpdate()
+tick(50)
+assert(#packets == nPk and has("lakes of a premade blueprint learned, not sent"), "premade lake was sent:\n" .. dump())
+lakes[121] = {fill = vec(120.0, 2.0, 10.0), props = lakes[1].props}
+fireLakeUpdate()
+tick(10)
+assert(#packets == nPk + 1 and packets[#packets].d.op == "add" and packets[#packets].d.x == 12000,
+  "lake after the premade window not sent:\n" .. dump())
 assert(not has("error") and not has("failed"), dump())
 return "ok: water sync"
 """

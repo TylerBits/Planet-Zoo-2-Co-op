@@ -330,6 +330,40 @@ void patchExeImport(const char* dll, const char* function, void* hook, void*& or
     patchImport(GetModuleHandleW(nullptr), dll, function, hook, original);
 }
 
+void patchExeImportByOrdinal(const char* dll, std::uint16_t ordinal, void* hook, void*& original) {
+    HMODULE module = GetModuleHandleW(nullptr);
+    auto* base = reinterpret_cast<std::uint8_t*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (dir.VirtualAddress == 0) {
+        return;
+    }
+    for (auto* desc = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); desc->Name != 0;
+         ++desc) {
+        if (_stricmp(reinterpret_cast<const char*>(base + desc->Name), dll) != 0 ||
+            desc->OriginalFirstThunk == 0) {
+            continue;
+        }
+        auto* names = reinterpret_cast<const IMAGE_THUNK_DATA*>(base + desc->OriginalFirstThunk);
+        auto* slots = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->FirstThunk);
+        for (; names->u1.AddressOfData != 0; ++names, ++slots) {
+            if (!IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal) || IMAGE_ORDINAL(names->u1.Ordinal) != ordinal) {
+                continue;
+            }
+            DWORD oldProtect = 0;
+            if (VirtualProtect(&slots->u1.Function, sizeof(slots->u1.Function), PAGE_READWRITE, &oldProtect)) {
+                if (original == nullptr) {
+                    original = reinterpret_cast<void*>(slots->u1.Function);
+                }
+                std::atomic_thread_fence(std::memory_order_release);
+                slots->u1.Function = reinterpret_cast<ULONG_PTR>(hook);
+                VirtualProtect(&slots->u1.Function, sizeof(slots->u1.Function), oldProtect, &oldProtect);
+            }
+        }
+    }
+}
+
 void startDiagnosticScan() {
 #ifdef PZ2COOP_DEV_DIAG
     std::thread(scanForLuaMarkers).detach();

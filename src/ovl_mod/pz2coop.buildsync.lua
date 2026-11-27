@@ -74,6 +74,10 @@ local c_nToolLogLimit = 300
 local c_nProofLimit = 3
 local c_nModeOpTimeout = 30 -- seconds to wait for an idle editor / for its commit of a remote part edit
 local c_nMaxRetries = 100 -- a remote job re-queued this often (undo never free when it commits) is dropped -- save-proofs per kind (habitat, each volume message type)
+-- Seconds after a premade blueprint commit (extended while its pieces keep settling) during which its groups,
+-- fences, paths and lakes are not sent on their own: the whole blueprint went as one k = "bp" packet.
+-- ponytail: a genuine edit inside this window is not sent either.
+local c_nPremadeQuiet = 3.0
 -- Undo hierarchy methods that receive the IDs of existing parts before they are moved or destroyed.
 local c_tPreImageMethods = {"EditExistingPart", "EditExistingParts", "DestroyExistingPart", "DestroyExistingParts"}
 
@@ -104,6 +108,11 @@ local s = {
   bRetry = false, -- set by Yielding_Commit when the undo system was taken; the job is queued again
   tWaitLogged = {}, -- wait reason -> already logged
   tBlueprintModes = {}, -- open BlueprintPlacementMode instances
+  tPremade = nil, -- game blueprint about to be committed: {id, x, y, z (cm), yaw, pitch, roll (rad)}
+  nPremadeUntil = -1, -- premade absorb window (see c_nPremadeQuiet)
+  nPremadeID = nil,
+  bPremadeRemote = false, -- the window belongs to a premade applied from the partner
+  bSending = false,
   worker = nil,
   fnOnLocalChange = nil,
   fnSettleListener = nil, -- RegionSync: told on every settle (a local commit or undo/redo finished)
@@ -536,7 +545,8 @@ local SendPlacePart = function(_obj, _tKey)
     yaw = _tKey.yaw, pitch = _tKey.pitch, roll = _tKey.roll})
 end
 
-local Job_SendPlace = function(_obj, _tKey, _op)
+-- _bNoSend: only save the file (own undo), e.g. a group that came with a premade blueprint sent whole.
+local Job_SendPlace = function(_obj, _tKey, _op, _bNoSend)
   local tWorldAPIs = api.world.GetWorldAPIs()
   local selection = tWorldAPIs.worldserialisation:CreateSaveSelection()
   tWorldAPIs.scenery:AddGroupToBlueprintSelection(_obj, selection)
@@ -547,12 +557,15 @@ local Job_SendPlace = function(_obj, _tKey, _op)
     Bridge.Log("build sync: blueprint save failed for " .. Label(_obj, _tKey) .. ": " .. tostring(sError))
     return
   end
-  Count("sent group")
   s.tGroupFile[_obj] = sFile
   if _op ~= nil then
     _op.sFile = sFile
   end
   Bridge.Log("build sync: blueprint saved " .. sFile .. " for " .. Label(_obj, _tKey))
+  if _bNoSend then
+    return
+  end
+  Count("sent group")
   Bridge.SendPacket(c_nPlaceObject, sFile, {x = _tKey.x, y = _tKey.y, z = _tKey.z})
 end
 
@@ -576,6 +589,28 @@ local Emit = function(_sWhat, _obj, _tKey, _bSending)
     s.tNetKey[_obj] = _sWhat == "place" and {x = tRemote.x, y = tRemote.y, z = tRemote.z} or nil
     Bridge.Log("build sync: " .. _sWhat .. " " .. Label(_obj, _tKey) .. " came from the remote player, not sent back")
     return false
+  end
+  -- A premade blueprint travels whole (k = "bp"): its groups/parts are never sent one by one, which mirrored
+  -- an aviary several times, half of the copies without decoration and none with its terrain edits.
+  if s.nClock < s.nPremadeUntil and (_sWhat == "place" or s.bPremadeRemote) then
+    s.nPremadeUntil = math.max(s.nPremadeUntil, s.nClock + c_nPremadeQuiet)
+    if s.bPremadeRemote then
+      -- Placed exactly where the sender's copy is, so the own position is the shared one.
+      s.tNetKey[_obj] = _sWhat == "place" and {x = _tKey.x, y = _tKey.y, z = _tKey.z} or nil
+      Bridge.Log("build sync: " .. _sWhat .. " " .. Label(_obj, _tKey) .. " came with the remote premade blueprint, not sent back")
+      return false
+    end
+    if _bSending then
+      Bridge.Log("build sync: local place " .. Label(_obj, _tKey) .. " is part of premade blueprint " ..
+        tostring(s.nPremadeID) .. ", not sent separately")
+      local op = {sKind = IsPart(_obj) and "part" or "group", sWhat = _sWhat, tKey = _tKey}
+      table.insert(s.tPendingOps, op)
+      s.tNetKey[_obj] = nil
+      if not IsPart(_obj) then
+        table.insert(s.tJobs, {fn = function() Job_SendPlace(_obj, _tKey, op, true) end})
+      end
+      return true
+    end
   end
   Bridge.Log("build sync: local " .. _sWhat .. " " .. Label(_obj, _tKey) .. " at " .. _tKey.sSig ..
     " [tool " .. s.sTool .. "]" .. (_bSending and "" or " (not in session, not sent)"))
@@ -616,6 +651,10 @@ local ProcessSettled = function(_bSending)
       s.tKnown[obj] = tKey
       s.tSeen[obj] = true
       s.tNetKey[obj] = s.tPendingNetKey
+      if s.tPendingNetKey ~= nil and s.tPendingNetKey.bPremade then
+        -- A premade lands on the sender's exact transform: each group sits where the sender's does.
+        s.tNetKey[obj] = tKey and {x = tKey.x, y = tKey.y, z = tKey.z} or nil
+      end
       local sOff = ""
       if tKey ~= nil and s.tPendingNetKey ~= nil then
         s.nLastLandedCm = Cm(DistCm(tKey, s.tPendingNetKey.x, s.tPendingNetKey.y, s.tPendingNetKey.z) / 100)
@@ -779,6 +818,20 @@ local PrepareBuildHierarchy = function(_hierarchy)
     if gt ~= nil and op ~= nil and gt.SetTerrainEditOpCollisionFlags ~= nil then
       gt:SetTerrainEditOpCollisionFlags(op, true, false, false, true, true, gt.CheckLakesMode_Off or 0, false)
     end
+    -- Vanilla placement turns the terrain grid preview off (SingleFeatureUndoablePlacementModeBase.PreviewAddNew,
+    -- PlacementRenderTerrainPreview() = false); left on, a mirrored premade kept a grid over its repainted ground.
+    if gt ~= nil and op ~= nil then
+      gt:SetTerrainEditOpGridRenderingEnabled(op, false)
+    end
+  end)
+end
+
+-- Vanilla clears the terrain preview geometry when a placement tool exits (singlefeatureundoableplacementmodebase
+-- .lua:909); our remote commits have no tool exit, so the grid stayed until the player's next preview.
+local ClearTerrainPreview = function()
+  pcall(function()
+    local tWorldAPIs = api.world.GetWorldAPIs()
+    tWorldAPIs.gameterrain:ClearPreviewRenderGeometry(tWorldAPIs.voxelterrain:GetPrimaryVoxelTerrainEntityID())
   end)
 end
 
@@ -858,6 +911,9 @@ Job_ApplyPlace = function(_sFile, _tData)
       VanillaPlacementCommitStep(hierarchy, moveObject)
     end, moveObject
   end)
+  if bCommitted ~= nil and not bViaEditor then
+    ClearTerrainPreview()
+  end
   if bCommitted == nil or bViaEditor then
     return -- retry later, or the editor route already counted and logged it
   elseif bCommitted then
@@ -867,6 +923,77 @@ Job_ApplyPlace = function(_sFile, _tData)
   else
     Count("apply failed")
     Bridge.Log("build sync: remote placement not applied (load failed or rejected by the undo system)")
+  end
+end
+
+-- A premade (game database) blueprint, sent as its ID + final transform. Loaded from the same database file
+-- vanilla loads (BlueprintPlacementMode.CreateNew), so the copy carries everything the original does: habitat,
+-- roof net, decoration, water and the terrain sink/paint/deform. The file path comes from the local database,
+-- never from the packet (CLAUDE.md rule 8).
+-- ponytail: a partner without the blueprint's DLC gets nothing for it (logged); fall back to per-group sends if needed.
+local Job_ApplyPremade = function(_tData)
+  local nID = type(_tData.id) == "number" and math.tointeger(_tData.id) or nil
+  for _, k in ipairs({"x", "y", "z", "yaw", "pitch", "roll"}) do
+    if type(_tData[k]) ~= "number" or not IsFinite(_tData[k]) then
+      nID = nil
+    end
+  end
+  local bOk, Mode = pcall(require, "Editors.Blueprint.BlueprintPlacementMode")
+  local sPath = nil
+  if nID ~= nil and nID > 0 and bOk and type(Mode) == "table" then
+    local bFound, sFound = pcall(Mode._GetBlueprintFileFromDatabase, nil, nID)
+    sPath = bFound and type(sFound) == "string" and sFound ~= "" and sFound or nil
+  end
+  if sPath == nil then
+    Count("apply failed")
+    Bridge.Log("build sync: premade blueprint " .. tostring(_tData.id) .. " not in the local database (DLC?), not placed")
+    return
+  end
+  s.nPremadeUntil = s.nClock + c_nPremadeQuiet
+  s.bPremadeRemote = true
+  s.nPremadeID = nID
+  NoteRemote(_tData.x, _tData.y, _tData.z)
+  local bCommitted, bViaEditor = Yielding_ApplyChange("premade", _tData, function(hierarchy)
+    PrepareBuildHierarchy(hierarchy)
+    Breadcrumb("load premade " .. nID .. " " .. sPath)
+    if not ParkLoadSaveManager():LoadBlueprintFromFile(sPath) then
+      Bridge.Log("build sync: premade blueprint load failed: " .. sPath)
+      return false
+    end
+    while not hierarchy:IsLoadedBlueprintReadyForEditing() do
+      coroutine.yield()
+    end
+    Breadcrumb("add premade to composite")
+    local moveObject = hierarchy:CreateCompositeObject({})
+    hierarchy:AddBlueprintToCompositeObject(moveObject)
+    -- Origin set up exactly as BlueprintPlacementMode.CreateNew does, so the sender's transform means the same.
+    local SceneryUtils = require("Editors.Scenery.Utils.SceneryUtils")
+    pcall(function() moveObject:DecayCompositeAlignmentType(moveObject.CompositeAlignmentType_ItemAligned) end)
+    pcall(SceneryUtils.SetInitialBoundingBoxPlacement, moveObject)
+    moveObject:SetCompositeOriginToOBBCentre()
+    pcall(function() moveObject:AlignCompositeRotation() end)
+    local vPos = Vector3:new(_tData.x / 100, _tData.y / 100, _tData.z / 100)
+    local vYpr = Vector3:new(_tData.yaw, _tData.pitch, _tData.roll)
+    moveObject:SetTransform(TransformQ.FromOrPos(Quaternion.FromYawPitchRoll(vYpr), vPos), {})
+    s.tPendingNetKey = {x = _tData.x, y = _tData.y, z = _tData.z, bPremade = true}
+    Breadcrumb("preview, commit premade")
+    return true, function()
+      VanillaPlacementCommitStep(hierarchy, moveObject)
+    end, moveObject
+  end)
+  s.nPremadeUntil = math.max(s.nPremadeUntil, s.nClock + c_nPremadeQuiet)
+  -- Not while the player's own tool is open (editor route): its preview is theirs.
+  if bCommitted ~= nil and not bViaEditor then
+    ClearTerrainPreview()
+  end
+  if bCommitted == nil or bViaEditor then
+    return
+  elseif bCommitted then
+    Count("applied premade")
+    Bridge.Log("build sync: remote premade blueprint " .. nID .. " applied at " .. _tData.x .. "," .. _tData.y .. "," .. _tData.z)
+  else
+    Count("apply failed")
+    Bridge.Log("build sync: remote premade blueprint " .. nID .. " not applied (load failed or rejected)")
   end
 end
 
@@ -1224,6 +1351,27 @@ local HookBlueprintMode = function()
     s.tBlueprintModes[self] = nil
     return fnShutdown(self, ...)
   end)
+  -- Premade (game database) blueprints are sent whole: ID + the transform vanilla commits with.
+  local fnTry, fnFailed, fnPlaced = rawget(Mode, "OnTryCommitCheck"), rawget(Mode, "OnFailedCommit"),
+    rawget(Mode, "FeaturePlaced")
+  if type(fnTry) == "function" and type(fnFailed) == "function" and type(fnPlaced) == "function" then
+    rawset(Mode, "OnTryCommitCheck", function(self, cMoveObject, ...)
+      local bOk, sErr = pcall(BuildSync.NotePremadeCommit, self.tGameBlueprint, cMoveObject)
+      if not bOk then
+        Bridge.Log("build sync: premade capture error: " .. tostring(sErr))
+      end
+      return fnTry(self, cMoveObject, ...)
+    end)
+    rawset(Mode, "OnFailedCommit", function(self, ...)
+      s.tPremade = nil
+      s.nPremadeUntil = -1
+      return fnFailed(self, ...)
+    end)
+    rawset(Mode, "FeaturePlaced", function(self, ...)
+      pcall(BuildSync.SendPremade)
+      return fnPlaced(self, ...)
+    end)
+  end
   Bridge.Log("build sync: blueprint tool hook installed")
 end
 
@@ -1445,6 +1593,11 @@ local HookUndoKeys = function()
 end
 
 BuildSync.OnPacket = function(_tMsg)
+  if _tMsg.nType == c_nPlaceObject and _tMsg.tData and _tMsg.tData.k == "bp" then
+    local tData = _tMsg.tData
+    QueueRemote(function() Job_ApplyPremade(tData) end, true, true)
+    return true
+  end
   if _tMsg.nType == c_nPlaceObject and _tMsg.tData and _tMsg.tData.k == "p" and type(_tMsg.tData.n) == "string" then
     local tData = _tMsg.tData
     table.insert(s.tJobs, {fn = function() Job_ApplyPlacePart(tData) end})
@@ -1558,6 +1711,19 @@ BuildSync.ResetSnapshot = function()
   s.tRedo = {}
   s.tPendingOps = {}
   s.tGroupFile = {}
+end
+
+-- Autotest (--warm / --case): drop what an earlier test case left behind (queued jobs, echo keys, the co-op
+-- undo journal), so it cannot leak into the next case. The job already running (s.worker) finishes normally.
+-- Returns how many queued jobs were dropped.
+BuildSync.ResetTransient = function()
+  local nDropped = #s.tJobs
+  s.tJobs = {}
+  s.tRecentRemote = {}
+  s.tUndo = {}
+  s.tRedo = {}
+  s.nUndoRedoTimer = nil
+  return nDropped
 end
 
 local Register = function(_sMsgType, _fn)
@@ -1713,6 +1879,58 @@ BuildSync.SetExternalBusyCheck = function(_fn)
   s.fnExternalBusy = _fn
 end
 
+-- RegionSync / WaterSync: changes now belong to a premade blueprint that travels (or arrived) whole.
+BuildSync.IsPremadeQuiet = function()
+  return s.nClock < s.nPremadeUntil
+end
+
+-- BlueprintPlacementMode.OnTryCommitCheck: remember a game blueprint's ID and final transform, and open the
+-- absorb window so the commit's pieces are not sent on their own.
+BuildSync.NotePremadeCommit = function(_tGameBlueprint, _cMoveObject)
+  s.tPremade = nil
+  if Bridge.IsApplying() or type(_tGameBlueprint) ~= "table" or _cMoveObject == nil then
+    return
+  end
+  local nID = type(_tGameBlueprint.blueprintID) == "number" and math.tointeger(_tGameBlueprint.blueprintID) or nil
+  if nID == nil then
+    return
+  end
+  local transform = _cMoveObject:GetTransform()
+  -- GetPosition/GetOrientation: BlueprintPlacementMode.SetMoveObjectTransform; GetOr/ToYawPitchRoll: PartKey.
+  local bOr, qOr = pcall(function() return transform:GetOrientation() end)
+  local vPos, vYpr = transform:GetPosition(), (bOr and qOr or transform:GetOr()):ToYawPitchRoll()
+  local Round = function(_n) return math.floor(_n * 1e6 + 0.5) / 1e6 end
+  local t = {k = "bp", id = nID, x = Cm(vPos:GetX()), y = Cm(vPos:GetY()), z = Cm(vPos:GetZ()),
+    yaw = Round(vYpr:GetX()), pitch = Round(vYpr:GetY()), roll = Round(vYpr:GetZ())}
+  for _, k in ipairs({"x", "y", "z", "yaw", "pitch", "roll"}) do
+    if not IsFinite(t[k]) then
+      return
+    end
+  end
+  s.tPremade = t
+  s.nPremadeID = nID
+  s.bPremadeRemote = false
+  s.nPremadeUntil = s.nClock + c_nPremadeQuiet
+end
+
+-- BlueprintPlacementMode.FeaturePlaced: the commit went through, send the whole blueprint once.
+BuildSync.SendPremade = function()
+  local t = s.tPremade
+  s.tPremade = nil
+  if t == nil then
+    return
+  end
+  s.nPremadeUntil = math.max(s.nPremadeUntil, s.nClock + c_nPremadeQuiet)
+  if not s.bSending then
+    Bridge.Log("build sync: local premade blueprint " .. t.id .. " placed (not in session, not sent)")
+    return
+  end
+  Count("sent premade")
+  Bridge.Log("build sync: local premade blueprint " .. t.id .. " placed at " .. t.x .. "," .. t.y .. "," .. t.z ..
+    " yaw " .. t.yaw .. ", sent whole")
+  Bridge.SendPacket(c_nPlaceObject, nil, t)
+end
+
 -- One heartbeat line: what was seen, sent, applied and failed, plus the habitat count (proves the
 -- habitat enumerator exists in retail).
 BuildSync.Summary = function()
@@ -1749,6 +1967,7 @@ BuildSync.Update = function(_nDeltaTime, _bSending)
     return
   end
   s.nClock = s.nClock + _nDeltaTime
+  s.bSending = _bSending == true
   for i = #s.tRecentRemote, 1, -1 do
     if s.nClock - s.tRecentRemote[i].nTime > c_nEchoWindow then
       table.remove(s.tRecentRemote, i)

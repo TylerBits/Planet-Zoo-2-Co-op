@@ -38,7 +38,7 @@ local c_nLoopOffsetCm = 5000 -- 50 m: wider than the prefab aquariums (29 m)
 local c_nLoopLimit = 200
 local c_nHandshakeHello, c_nSaveChunkData, c_nSaveLoadCommit, c_nCursor, c_nLedgerSync, c_nPresenceAvatar, c_nVehiclePose =
   0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x13
-local c_sModVersion = "0.3.0"
+local c_sModVersion = "0.4.0"
 -- Offline/local park modes supported in co-op. Franchise is strictly excluded (CLAUDE.md rules 6 & 8).
 local c_tAllowedModes = {
   Sandbox = true,
@@ -277,6 +277,13 @@ Bridge.TakeResync = function()
   return bRequested
 end
 
+-- version.dll reports the Explore hotkey (` key); presence.lua takes it on its next frame.
+Bridge.TakeExploreHotkey = function()
+  local nBeat = s.nExploreHotkeyBeat
+  s.nExploreHotkeyBeat = nil
+  return nBeat ~= nil and s.t ~= nil and s.t[c_nSlotBeat] - nBeat <= 10
+end
+
 Bridge.GetModVersion = function()
   return c_sModVersion
 end
@@ -488,6 +495,12 @@ Bridge.TakeAutotestPlan = function()
   return sPlan
 end
 
+Bridge.TakeAutotestEvalHex = function()
+  local sHex = s.sAutotestEvalHex
+  s.sAutotestEvalHex = nil
+  return sHex
+end
+
 -- The park manager registers while a park is loaded; nil = messages are only logged.
 Bridge.SetHandler = function(_fnHandler)
   s.fnHandler = _fnHandler
@@ -501,7 +514,8 @@ local Session = function()
   return s.tSession
 end
 
-local c_tQuietEvents = {status = true, friends = true, invited = true, avatar = true, save_progress = true}
+local c_tQuietEvents = {status = true, friends = true, invited = true, avatar = true, save_progress = true,
+  hotkey_explore = true}
 
 local TrackSession = function(_tEvent)
   local sEvent = _tEvent.event
@@ -567,8 +581,12 @@ local TrackSession = function(_tEvent)
       nBytes = tonumber(_tEvent.bytes) or 0, bReceived = false}
   elseif sEvent == "invited" then
     tSession.tInvited[tostring(_tEvent.id)] = true
+  elseif sEvent == "hotkey_explore" then
+    -- Stamped with the frame heartbeat so a press during a loading screen does not fire once the park opens.
+    s.nExploreHotkeyBeat = s.t and s.t[c_nSlotBeat]
   elseif sEvent == "autotest" then
     s.sAutotestPlan = tostring(_tEvent.plan or "full")
+    s.sAutotestEvalHex = type(_tEvent.code_hex) == "string" and _tEvent.code_hex or nil
   elseif sEvent == "error" then
     tSession.sError = tostring(_tEvent.code)
   end

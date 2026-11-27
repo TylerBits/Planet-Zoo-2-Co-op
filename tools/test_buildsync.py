@@ -25,9 +25,11 @@ for _, name in ipairs({"EditExistingPart", "EditExistingParts", "DestroyExisting
 end
 hierarchyMT.GetFullUndoChangeList = function() return {} end
 hierarchyMT.CreateCompositeObject = function() return {Destroy = function() end, GetOBB = function() return nil end,
-  GetFlattenTerrainToggleState = function() return 2 end,
-  SetCompositeOriginToOBBCentre = function() end, SetTransform = function() end} end
+  GetFlattenTerrainToggleState = function() return 2 end, CompositeAlignmentType_ItemAligned = 1,
+  DecayCompositeAlignmentType = function() end, AlignCompositeRotation = function() end,
+  SetCompositeOriginToOBBCentre = function() end, SetTransform = function(_, t) lastTransform = t end} end
 hierarchyMT.IsLoadedBlueprintReadyForEditing = function() return true end
+hierarchyMT.GetTerrainEditOperation = function() return {} end
 hierarchyMT.AddBlueprintToCompositeObject = function() end
 hierarchyMT.SetPerformTerrainModificationsModifyVolumes = function(_, b) terrainEdits = b end
 local tWorldAPIs = {
@@ -75,6 +77,10 @@ local tWorldAPIs = {
     SetIsTutorialActive = function(_, b) tutorialActive = b end,
   },
   facilities = {GetAllHabitatsEntityIDs = function() return {} end},
+  gameterrain = {SetTerrainEditOpCollisionFlags = function() end, CheckLakesMode_Off = 0,
+    SetTerrainEditOpGridRenderingEnabled = function(_, _, b) gridOn = b end,
+    ClearPreviewRenderGeometry = function(_, e) previewCleared = e end},
+  voxelterrain = {GetPrimaryVoxelTerrainEntityID = function() return 77 end},
   habitat = {GetHabitatIDFromEntityID = function() end},
   habitatboundary = {GetBoundaryObjectsForHabitat = function() end},
   money = {GetCash = function() end, ModifyCash = function() end},
@@ -111,7 +117,8 @@ api = {
     RegisterReceiver = function(n, fn) receivers[n] = fn end, UnregisterReceiver = function() end,
   }, {__index = function(_, k) return k end}),
   game = {GetEnvironment = function() return {RequireInterface = function() return {
-    SaveBlueprintToFile = function() return true end, LoadBlueprintFromFile = function() return true end} end} end},
+    SaveBlueprintToFile = function() return true end,
+    LoadBlueprintFromFile = function(_, f) loaded = f return true end} end} end},
 }
 local Bridge = {
   Log = function(s) table.insert(log, s) end, Flush = function() end,
@@ -140,6 +147,13 @@ local stubs = {
     NonYielding_AddPartToDestroyIntoCompositeObject = function(_, _, id) table.insert(destroyed, id) end,
     Yielding_DestroyCompositeContents = function() end,
   },
+  -- vanilla methods the premade hook wraps (editors.blueprint.blueprintplacementmode.lua)
+  ["Editors.Blueprint.BlueprintPlacementMode"] = {
+    Init = function() end, Shutdown = function() end, OnTryCommitCheck = function() end,
+    OnFailedCommit = function() end, FeaturePlaced = function() end,
+    _GetBlueprintFileFromDatabase = function(_, id) return id == 42 and "Blueprints/Aviary42.bp" or nil end,
+  },
+  ["Editors.Scenery.Utils.SceneryUtils"] = {SetInitialBoundingBoxPlacement = function() end},
 }
 require = function(name)
   if stubs[name] then return stubs[name] end
@@ -255,7 +269,68 @@ assert(has("refused by the active editor"), "refused editor op did not exit prom
 assert(tutorialActive == true and not Bridge.IsApplying(), "guards leaked after refused editor commit")
 local summary = BuildSync.Summary()
 assert(string.find(summary, "parts seen=4", 1, true), "summary wrong: " .. summary)
-return "ok: " .. summary
+-- Premade (game database) blueprint: sent ONCE as id + transform; its pieces are not sent one by one
+-- (an aviary got mirrored several times, half the copies without decoration, none with its terrain edits)
+local BPM = require("Editors.Blueprint.BlueprintPlacementMode")
+for _ = 1, 20 do BuildSync.Update(0.1, true) end -- past the refused op's remote-commit grace window
+local mode ={tGameBlueprint = {blueprintID = 42}}
+BPM.Init(mode)
+local mo = {GetTransform = function() return {GetPosition = function() return vec(100.5, 2, -30.25) end,
+  GetOrientation = function() return {ToYawPitchRoll = function() return vec(0.785398, 0, 0) end} end} end}
+local nP = #packets
+BPM.OnTryCommitCheck(mode, mo)
+parts[901] = {name = "pl_aviary_perch", pos = vec(101, 2, -30)}
+receivers.MsgType_PlacementPartCommittedMessage({{nPlacementPartID = 901}})
+BuildSync.Update(0.1, true)
+assert(#packets == nP, "premade piece was sent on its own")
+assert(has("is part of premade blueprint 42, not sent separately"), table.concat(log, "\n"))
+BPM.FeaturePlaced(mode)
+local bp = packets[nP + 1]
+assert(#packets == nP + 1 and bp.n == 0x20 and bp.f == nil and bp.d.k == "bp" and bp.d.id == 42 and
+  bp.d.x == 10050 and bp.d.y == 200 and bp.d.z == -3025 and bp.d.yaw == 0.785398 and bp.d.pitch == 0,
+  "premade packet missing or wrong")
+assert(BuildSync.IsPremadeQuiet(), "premade window not open after placement")
+for _ = 1, 40 do BuildSync.Update(0.1, true) end
+assert(not BuildSync.IsPremadeQuiet(), "premade window never closed")
+-- refused commit: nothing sent, window closed at once
+BPM.OnTryCommitCheck(mode, mo)
+BPM.OnFailedCommit(mode)
+BPM.FeaturePlaced(mode)
+assert(#packets == nP + 1 and not BuildSync.IsPremadeQuiet(), "refused premade commit sent or kept the window")
+-- own (local save) blueprint: no k = "bp", pieces go as before
+local mLocal = {tLocalBlueprint = {saveToken = 1}}
+BPM.OnTryCommitCheck(mLocal, mo)
+parts[902] = {name = "pl_rock_01", pos = vec(103, 2, -31)}
+receivers.MsgType_PlacementPartCommittedMessage({{nPlacementPartID = 902}})
+BuildSync.Update(0.1, true)
+BPM.FeaturePlaced(mLocal)
+assert(#packets == nP + 2 and packets[nP + 2].d.k == "p" and packets[nP + 2].d.n == "pl_rock_01",
+  "own-save blueprint piece not sent as before")
+BPM.Shutdown(mode) -- the tool closes after placing; remote blueprints wait for the shared slot until then
+-- receiver: loads the SAME database file and commits it on the sender's transform with the vanilla terrain step
+loaded, lastTransform, terrainEdits, terrainAction, gridOn, previewCleared = nil, nil, nil, nil, nil, nil
+BuildSync.OnPacket({nType = 0x20, tData = {k = "bp", id = 42, x = 15050, y = 200, z = -3025, yaw = 0.785398, pitch = 0, roll = 0}})
+for _ = 1, 20 do BuildSync.Update(0.1, true) end
+assert(loaded == "Blueprints/Aviary42.bp", "premade not loaded from the database file: " .. tostring(loaded) ..
+  "\n" .. table.concat(log, "\n"))
+assert(lastTransform and lastTransform.pos.GetX() == 150.5 and lastTransform.pos.GetZ() == -30.25 and
+  lastTransform.q.ypr.GetX() == 0.785398, "premade transform wrong")
+assert(terrainEdits == true and terrainAction == 3, "premade committed without the vanilla terrain step")
+-- the terrain grid preview stayed drawn over the mirrored premade's repainted ground until the next preview
+assert(gridOn == false and previewCleared == 77, "terrain grid preview left on after the remote premade")
+assert(has("remote premade blueprint 42 applied"), table.concat(log, "\n"))
+assert(BuildSync.IsPremadeQuiet(), "receiver does not absorb its own premade echoes")
+for _ = 1, 40 do BuildSync.Update(0.1, true) end
+-- bad ids never load anything (the path always comes from the local database)
+loaded = nil
+for _, bad in ipairs({"42", -1, 7, 4.5}) do
+  BuildSync.OnPacket({nType = 0x20, tData = {k = "bp", id = bad, x = 0, y = 0, z = 0, yaw = 0, pitch = 0, roll = 0}})
+end
+BuildSync.OnPacket({nType = 0x20, tData = {k = "bp", id = 42, x = 0, y = 0, z = 0, yaw = 0 / 0, pitch = 0, roll = 0}})
+for _ = 1, 20 do BuildSync.Update(0.1, true) end
+assert(loaded == nil and has("not in the local database"), "bad premade id loaded something")
+assert(not has("job failed"), "a job failed:\n" .. table.concat(log, "\n"))
+return "ok: " .. BuildSync.Summary()
 """
 
 

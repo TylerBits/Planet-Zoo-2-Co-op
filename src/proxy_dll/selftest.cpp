@@ -6,6 +6,7 @@
 #include "spsc_queue.hpp"
 #include "steam_p2p.hpp"
 #include "ui_overlay.hpp"
+#include "vehicle_patch.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -219,7 +220,7 @@ int main(int argc, char** argv) {
         // 0x01 HANDSHAKE_HELLO forwards JSON metadata (mode, scenario, diff, wild, ver) and keeps empty hello.
         writeText(dir / "out_3.txt", "{\"cmd\":\"ack\",\"n\":\"2\"}\n#end\n");
         bridge.poll([](bool, std::string_view) {}, t0 + std::chrono::milliseconds(160));
-        const std::string helloJson = R"({"mode":"ScenarioCareer","scenario":"Scenario_01","diff":"Default","wild":false,"ver":"0.3.0"})";
+        const std::string helloJson = R"({"mode":"ScenarioCareer","scenario":"Scenario_01","diff":"Default","wild":false,"ver":"0.4.0"})";
         std::vector<std::uint8_t> helloPkt{0x01};
         helloPkt.insert(helloPkt.end(), helloJson.begin(), helloJson.end());
         bridge.forward({pz2::MsgKind::Packet, std::vector<std::uint8_t>{0x01}});
@@ -393,6 +394,23 @@ int main(int argc, char** argv) {
         const std::uint8_t truncLit[6] = {10, 0, 0, 0, 0x50, 'A'};
         check(!pz2::lz4DecompressPayload(truncLit, sizeof(truncLit), pz2::kMaxPayloadSize).has_value(),
               "lz4 rejects truncated literals");
+    }
+
+    // Vehicle forced-boundary AOB patcher checks (unique match, patch, restore, ambiguity rejection).
+    {
+        std::vector<std::uint8_t> buf(64, 0x90);
+        const std::uint8_t sig[13] = {0x45, 0x38, 0x81, 0xF1, 0x00, 0x00, 0x00, 0x0F, 0x85, 0x3F, 0x06, 0x00, 0x00};
+        std::memcpy(buf.data() + 16, sig, sizeof(sig));
+        check(pz2::patchVehicleBoundsInBuffer(buf.data(), buf.size(), true), "vehicle patch applies to unique sig");
+        check(buf[23] == 0x90 && buf[24] == 0xE9 && buf[25] == 0x3F && buf[26] == 0x06, "vehicle patch writes nop+jmp");
+        check(pz2::patchVehicleBoundsInBuffer(buf.data(), buf.size(), false), "vehicle patch restores jne");
+        check(buf[23] == 0x0F && buf[24] == 0x85 && buf[25] == 0x3F && buf[26] == 0x06, "vehicle patch restores bytes");
+        // Duplicate signature must be rejected cleanly.
+        std::memcpy(buf.data() + 40, sig, sizeof(sig));
+        check(!pz2::patchVehicleBoundsInBuffer(buf.data(), buf.size(), true), "vehicle patch rejects ambiguous sig");
+        // Missing signature must be rejected cleanly.
+        std::vector<std::uint8_t> empty(64, 0xCC);
+        check(!pz2::patchVehicleBoundsInBuffer(empty.data(), empty.size(), true), "vehicle patch rejects missing sig");
     }
 
     std::printf("selftest: %d check(s) failed\n", g_failures);

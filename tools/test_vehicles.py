@@ -833,6 +833,35 @@ for _, p in ipairs(packets) do
 end
 assert(bSawSeat and bSawLights and bSawPose, "OnPeerConnected must sync seat, headlights, and driver pose")
 
+-- Directional auto-open for guest doors: must open when facing entrance, NOT when driving past parallel.
+local tDoor = {gx = 10, gy = 0, gz = 20, fx = 0, fz = 1, rx = 1, rz = 0, nHalfW = 1.50}
+-- Approaching straight toward entrance from 4 m away (heading +Z) -> OPEN
+assert(Vehicles.ShouldAutoOpenDoor({x = 10, y = 0, z = 16, fx = 0, fz = 1, spd = 4}, tDoor, false) == true,
+  "guest door must auto-open when approaching and facing entrance")
+-- Driving parallel right past the entrance (2 m in front, heading +X along wall) -> DO NOT OPEN
+assert(Vehicles.ShouldAutoOpenDoor({x = 10, y = 0, z = 18, fx = 1, fz = 0, spd = 5}, tDoor, false) == false,
+  "guest door must NOT auto-open when vehicle drives past parallel")
+-- Driving away from the entrance (4 m in front, heading -Z) -> DO NOT OPEN
+assert(Vehicles.ShouldAutoOpenDoor({x = 10, y = 0, z = 16, fx = 0, fz = -1, spd = 4}, tDoor, false) == false,
+  "guest door must NOT auto-open when vehicle faces away from entrance")
+-- Off to the side (lateral offset 3.5 m > nHalfW+1.0) -> DO NOT OPEN
+assert(Vehicles.ShouldAutoOpenDoor({x = 13.5, y = 0, z = 16, fx = 0, fz = 1, spd = 4}, tDoor, false) == false,
+  "guest door must NOT auto-open when vehicle is outside entrance lateral corridor")
+-- Hysteresis: stays open while crossing and until > 7.5 m past
+assert(Vehicles.ShouldAutoOpenDoor({x = 10, y = 0, z = 25, fx = 0, fz = 1, spd = 4}, tDoor, true) == true,
+  "guest door must stay open while vehicle clears doorway")
+assert(Vehicles.ShouldAutoOpenDoor({x = 10, y = 0, z = 28.5, fx = 0, fz = 1, spd = 4}, tDoor, true) == false,
+  "guest door must close once vehicle is > 7.5 m clear")
+
+-- Portal pass-through corridor: wide doors/guest doors/cutouts allowed; small 1 m doors rejected; side wall rejected.
+assert(Vehicles.IsVehicleInPortalCorridor({x = 10, y = 0, z = 18.5, fx = 0, fz = 1}, tDoor) == true,
+  "vehicle aligned in wide guest door corridor must enable pass-through")
+assert(Vehicles.IsVehicleInPortalCorridor({x = 13.0, y = 0, z = 19.0, fx = 0, fz = 1}, tDoor) == false,
+  "vehicle hitting solid side wall off-center must NOT enable pass-through")
+local tSmallDoor = {gx = 10, gy = 0, gz = 20, fx = 0, fz = 1, rx = 1, rz = 0, nHalfW = 0.70}
+assert(Vehicles.IsVehicleInPortalCorridor({x = 10, y = 0, z = 19.0, fx = 0, fz = 1}, tSmallDoor) == false,
+  "small 1 m single door must NOT allow vehicle pass-through")
+
 print("ok: 4-seat research vehicle tests passed")
 """
 

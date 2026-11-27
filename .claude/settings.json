@@ -1,4 +1,11 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(python tools/agent_status.py:*)",
+      "Bash(python tools/run_all_tests.py:*)",
+      "Bash(python tools/verify_gate.py:*)"
+    ]
+  },
   "hooks": {
     "SessionStart": [
       {

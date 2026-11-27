@@ -96,6 +96,7 @@ def main() -> int:
         ("two-peer E2E wire", [py, "tools/test_two_peer_e2e.py"]),
         ("ui JS headless", [shutil.which("node"), "tools/test_ui_js.mjs"] if shutil.which("node") else None),
         ("verify gate + live stamp", [py, "tools/test_verify_gate.py"]),
+        ("mutation smoke check", [py, "tools/test_assertion_quality.py"]),
         ("crash dump symbols", [py, "tools/test_pdb_symbols.py"]),
         ("release invariants", check_invariants),
     ]
@@ -118,6 +119,10 @@ def main() -> int:
             failures += 1
 
     elapsed = time.monotonic() - t0
+    if failures == 0:
+        sys.path.insert(0, str(ROOT / "tools"))
+        import verify_gate  # noqa: E402 - only after ALL PASSED
+        verify_gate.write_offline_stamp(ROOT)
     if quiet:
         print(f"PASS: {ran}/{ran}" if failures == 0 else f"FAIL: {failures}/{ran}")
     else:

@@ -373,7 +373,7 @@ PZ2CoopManager._SendHandshakeHello = function(self)
     scenario = self.sScenarioCode,
     diff = self.sGameDifficulty,
     wild = self.bIsWildArea == true,
-    ver = Bridge.GetModVersion and Bridge.GetModVersion() or "0.3.0",
+    ver = Bridge.GetModVersion and Bridge.GetModVersion() or "0.4.0",
   })
 end
 

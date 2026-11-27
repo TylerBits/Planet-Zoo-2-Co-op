@@ -3,11 +3,13 @@
 #include "diag.hpp"
 #include "lz4_codec.hpp"
 #include "spsc_queue.hpp"
+#include "vehicle_patch.hpp"
 
 #include <windows.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -283,6 +285,9 @@ struct Api {
     void* matchmaking = nullptr;
     void* sockets = nullptr;
     void* utils = nullptr;
+    void* networkingUtils = nullptr;
+
+    void (*InitRelayNetworkAccess)(void*) = nullptr;
 
     SteamAPICall_t (*CreateLobby)(void*, std::int32_t, int) = nullptr;
     SteamAPICall_t (*JoinLobby)(void*, std::uint64_t) = nullptr;
@@ -354,7 +359,18 @@ bool resolve(Api& api) {
         return false;
     }
     api.matchmaking = findOrCreateUserInterface(user, kMatchmakingVersion);
-    api.sockets = findOrCreateUserInterface(user, kSocketsVersion);
+    void* (*getSocketsAccessor)() = nullptr;
+    if (load(getSocketsAccessor, "SteamAPI_SteamNetworkingSockets_SteamAPI_v012")) {
+        api.sockets = getSocketsAccessor();
+    }
+    if (api.sockets == nullptr) {
+        api.sockets = findOrCreateUserInterface(user, kSocketsVersion);
+    }
+    void* (*getNetUtilsAccessor)() = nullptr;
+    if (load(getNetUtilsAccessor, "SteamAPI_SteamNetworkingUtils_SteamAPI_v004")) {
+        api.networkingUtils = getNetUtilsAccessor();
+    }
+    load(api.InitRelayNetworkAccess, "SteamAPI_ISteamNetworkingUtils_InitRelayNetworkAccess");
     api.utils = findOrCreateUserInterface(user, kUtilsVersion);
     api.friends = findOrCreateUserInterface(user, kFriendsVersion);
     load(api.GetPersonaName, "SteamAPI_ISteamFriends_GetPersonaName");
@@ -437,26 +453,48 @@ void emit(const std::string& json) {
 
 void emitError(const char* code) { emit(std::string(R"({"event":"error","code":")") + code + "\"}"); }
 
-// Steam's matchmaking/utils interfaces are not thread-safe, and two host attempts crashed inside steamclient64
-// (read of 0x300000151 in CreateListenSocketP2P). So our Steam calls and the game's per-frame
-// SteamAPI_RunCallbacks never overlap: both hold this lock. Recursive in case a game callback re-enters.
+// Steam's matchmaking/networking/utils interfaces are not thread-safe against PlanetZoo2.exe's own
+// main-thread Steam calls (CreateListenSocketP2P crashed inside steamclient64.dll+0xb73244 reading
+// 0x300000151 from a corrupted vtable on our background thread even when SteamAPI_RunCallbacks held a
+// mutex). Running Session::step() directly inside hkRunCallbacks() on the game's main thread serializes
+// 100% of our Steamworks calls with EVERY Steam call the game makes. The background thread only acts as
+// a >250 ms fallback before the hook attaches or during blocking loads.
 std::recursive_mutex g_steamMutex;
 using RunCallbacksFn = void (*)();
-// Written by patchExeImport before the IAT slot points at hkRunCallbacks: the game calls RunCallbacks every
-// frame, and assigning it after the patch returned crashed launches that hit the gap (null call).
 void* g_gameRunCallbacks = nullptr;
+std::atomic<bool> g_hookInstalled{false};
+std::atomic<std::int64_t> g_lastMainTickMs{0};
+
+class Session;
+Session* g_session = nullptr;
+
+std::int64_t steadyNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+void stepSessionFromMainThread();
 
 void hkRunCallbacks() {
     std::lock_guard lock(g_steamMutex);
     reinterpret_cast<RunCallbacksFn>(g_gameRunCallbacks)();
+    g_lastMainTickMs.store(steadyNowMs(), std::memory_order_release);
+    stepSessionFromMainThread();
 }
 
-// Called once Steam is initialised, so the loader has long since bound the game's steam_api64 imports.
+// Called as soon as steam_api64.dll is loaded so even initial interface resolution & SDR init run on the main thread.
 void hookGameRunCallbacks() {
+    if (g_hookInstalled.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (GetModuleHandleW(L"steam_api64.dll") == nullptr) {
+        return;
+    }
     patchExeImport("steam_api64.dll", "SteamAPI_RunCallbacks", reinterpret_cast<void*>(&hkRunCallbacks),
                    g_gameRunCallbacks);
-    diagLog(g_gameRunCallbacks != nullptr ? "steam: game's SteamAPI_RunCallbacks now shares our Steam lock"
-                                          : "steam: SteamAPI_RunCallbacks import not found; Steam calls not serialised");
+    g_hookInstalled.store(true, std::memory_order_release);
+    diagLog(g_gameRunCallbacks != nullptr ? "steam: game's SteamAPI_RunCallbacks now shares our Steam lock (main-thread Steam pump)"
+                                          : "steam: SteamAPI_RunCallbacks import not found; using fallback thread");
 }
 
 std::optional<std::uint64_t> parseU64(const std::string& text) {
@@ -474,24 +512,33 @@ class Session {
 public:
     [[noreturn]] void run() {
         using namespace std::chrono_literals;
-        auto nextResolve = Clock::now();
-        auto nextUnreliableFlush = Clock::now();
         for (;;) {
-            tick(Clock::now(), nextResolve, nextUnreliableFlush);
-            std::this_thread::sleep_for(1ms); // outside the lock, so the game's frame never waits long
+            if (!g_hookInstalled.load(std::memory_order_acquire)) {
+                std::lock_guard lock(g_steamMutex);
+                hookGameRunCallbacks();
+            }
+            const std::int64_t lastMain = g_lastMainTickMs.load(std::memory_order_acquire);
+            const bool mainActive = g_gameRunCallbacks != nullptr && lastMain != 0 && (steadyNowMs() - lastMain) < 250;
+            if (!mainActive) {
+                step();
+            }
+            std::this_thread::sleep_for(mainActive ? 25ms : 5ms);
         }
     }
 
-private:
-    void tick(Clock::time_point now, Clock::time_point& nextResolve, Clock::time_point& nextUnreliableFlush) {
+    void step() {
         using namespace std::chrono_literals;
         std::lock_guard lock(g_steamMutex);
-        if (!ready_ && now >= nextResolve) {
+        const auto now = Clock::now();
+        if (!ready_ && now >= nextResolve_) {
             ready_ = steam::resolve(api_);
-            nextResolve = now + 500ms;
+            nextResolve_ = now + 500ms;
             if (ready_) {
                 debugLog("Steam interfaces resolved");
-                hookGameRunCallbacks();
+                if (api_.networkingUtils && api_.InitRelayNetworkAccess) {
+                    api_.InitRelayNetworkAccess(api_.networkingUtils);
+                    diagLog("steam: InitRelayNetworkAccess called");
+                }
                 emit(R"({"event":"steam_ready"})");
             }
         }
@@ -505,11 +552,13 @@ private:
         if (ready_) {
             flushReliable();
         }
-        if (ready_ && now >= nextUnreliableFlush) {
+        if (ready_ && now >= nextUnreliableFlush_) {
             flushUnreliable(); // Channel 1 runs at 40 Hz so 20 Hz presence poses don't alias/stutter.
-            nextUnreliableFlush = now + 25ms;
+            nextUnreliableFlush_ = now + 25ms;
         }
     }
+
+private:
 
     enum class Role { None, Host, Client };
     enum class Pending { None, CreateLobby, JoinLobby };
@@ -549,6 +598,11 @@ private:
                 return;
             }
             emit(R"({"event":"invited","id":")" + std::to_string(*friendId) + "\"}");
+        } else if (cmd == "veh_bounds") {
+            const bool remove = jsonGetString(json, "remove") == "1";
+            pz2::setVehicleForcedBoundariesRemoved(remove);
+        } else if (cmd == "autotest_drive") {
+            pz2::setAutotestDriveThrottle(jsonGetString(json, "on") == "1");
         } else if (cmd == "host" || cmd == "join") {
             if (!ready_) {
                 emitError("steam_not_ready");
@@ -1074,6 +1128,8 @@ private:
 
     steam::Api api_;
     bool ready_ = false;
+    Clock::time_point nextResolve_{};
+    Clock::time_point nextUnreliableFlush_{};
     Role role_ = Role::None;
     Pending pending_ = Pending::None;
     steam::SteamAPICall_t call_ = 0;
@@ -1095,12 +1151,19 @@ private:
     std::deque<std::vector<std::uint8_t>> reliableBacklog_;
 };
 
+void stepSessionFromMainThread() {
+    if (g_session != nullptr) {
+        g_session->step();
+    }
+}
+
 } // namespace
 
 void startSteamP2P() {
     // Intentionally leaked: the thread lives for the whole process and must never be joined
     // from DllMain (loader lock), nor destroyed while joinable at exit.
     auto* session = new Session();
+    g_session = session;
     std::thread([session] { session->run(); }).detach();
 }
 

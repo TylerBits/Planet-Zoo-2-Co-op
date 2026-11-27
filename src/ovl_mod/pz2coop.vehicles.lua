@@ -50,8 +50,11 @@ local c_nPassengerEyeFwdOfNeck = 0.08 -- 1P eyes sit 8 cm forward of neck collar
 local c_nDefaultSitNeckY = 0.51    -- measured live TM $OnRideSitIdle def_c_neck1_joint Y before live bone sample
 local c_nDefaultSitNeckZ = 0.03
 local c_nPassengerYawClamp = math.rad(115) -- wide look-around arc for sightseeing & photography
-local c_nAutoGateOpenDist = 5.5    -- metres: auto-open safari/habitat gates when driving up
-local c_nAutoGateCloseDist = 7.5   -- metres: release auto-opened gate once cleared
+local c_nAutoGateOpenDist = 6.0    -- metres perpendicular: auto-open guest/safari/habitat gates when approaching entrance
+local c_nAutoGateCloseDist = 7.5   -- metres perpendicular: release auto-opened gate once cleared
+local c_nMinPassableHalfW = 1.10   -- minimum doorway/cutout half-width (2.2 m wide) for vehicle pass-through
+local c_nPortalPassPerp = 4.0      -- metres perpendicular from doorway plane (clears ~2 m front bumper + gate frame)
+local c_nPortalPassLatPad = 0.85   -- lateral margin around doorway half-width before restoring wall collision
 local c_nRecallForwardDist = 4.5   -- metres in front of player when recalling vehicle
 local c_nSwapCooldown = 0.30       -- seconds debounce so holding/bouncing Q never cycles multiple seats
 local c_nLightsCooldown = 0.25     -- seconds debounce on L headlight toggle
@@ -122,7 +125,10 @@ if s == nil then
     bHeadlightsOn = false,
     bHeadlightsManual = false,-- true once user/peer toggled L; reinforces native Light state vs NightLighting
     tDisabledLights = {},     -- nLightEntityID -> true while holding ClaimDisableLight
-    nAutoOpenGate = nil,      -- habitat gate entity auto-opened while driving
+    tAutoOpenGate = nil,      -- {id, sMgVar, gx, gy, gz, fx, fz, rx, rz, nHalfW} auto-opened while driving
+    bVehPortalGhost = false,  -- true while chassis collision is temporarily disabled crossing an open portal
+    nVehPhysEnt = nil,        -- cached Flag_Car_OffTrack physics entity ID for active vehicle
+    nVehPhysFor = nil,        -- vehicle root entity ID matching nVehPhysEnt
     nPoseSendTimer = 0,
     tRemotePose = nil,        -- {x, y, z, yaw, pitch, roll, spd, steer, rxAt}
     tSmoothPose = nil,        -- {x, y, z, yaw, pitch, roll}
@@ -727,32 +733,258 @@ Vehicles.ToggleHeadlights = function(_bForceState, _bNoSend)
   return bNext
 end
 
--- ---- auto-open safari / habitat gates while driving ---------------------------------------------
+-- ---- auto-open guest/safari/habitat gates & wide doorway/cutout pass-through ---------------------
 
-local ReleaseAutoGate = function()
-  if s.nAutoOpenGate == nil then
+local ExtractPortalBasis = function(_tr)
+  if _tr == nil then
+    return nil
+  end
+  local vPos = _tr.GetPos and _tr:GetPos() or (_tr.Pos and _tr:Pos())
+  local gx, gy, gz = ReadVec3(vPos)
+  if gx == nil then
+    return nil
+  end
+  local fx, fz = 0, 1
+  if _tr.GetF ~= nil then
+    local vF = _tr:GetF()
+    local vx, _, vz = ReadVec3(vF)
+    if vx ~= nil then
+      local nLen = math.sqrt(vx * vx + vz * vz)
+      if nLen > 1e-4 then
+        fx, fz = vx / nLen, vz / nLen
+      end
+    end
+  else
+    local nYaw = ExtractTransformYPR(_tr)
+    fx, fz = math.sin(nYaw), math.cos(nYaw)
+  end
+  return gx, gy, gz, fx, fz, fz, -fx
+end
+
+local ResolveEntityResourceName = function(_tWorld, _nEnt)
+  if _tWorld == nil or _nEnt == nil then
+    return nil
+  end
+  local placement = _tWorld.placement
+  local trApi = _tWorld.transform
+  local nCur = _nEnt
+  for _ = 1, 4 do
+    if nCur == nil then
+      break
+    end
+    if placement ~= nil and placement.GetPartResourceName ~= nil then
+      local bOk, sRes = pcall(placement.GetPartResourceName, placement, nCur)
+      if bOk and type(sRes) == "string" and sRes ~= "" then
+        return sRes
+      end
+    end
+    if api.entity ~= nil and api.entity.GetName ~= nil then
+      local bNOk, sName = pcall(api.entity.GetName, nCur)
+      if bNOk and type(sName) == "string" and sName ~= "" and sName ~= "GateModel" and sName ~= "DoorModel" then
+        return sName
+      end
+    end
+    if trApi == nil or trApi.GetParent == nil then
+      break
+    end
+    local bP, nPar = pcall(trApi.GetParent, trApi, nCur)
+    if not bP or nPar == nil or nPar == nCur then
+      break
+    end
+    nCur = nPar
+  end
+  return nil
+end
+
+local ClassifyVehicleAutoGate = function(_tWorld, _nEnt)
+  if _tWorld == nil or _nEnt == nil then
+    return nil
+  end
+  if Presence.IsAquariumStaffDoorEntity ~= nil and Presence.IsAquariumStaffDoorEntity(_nEnt) then
+    return nil
+  end
+  local nGateId = _nEnt
+  local sPropName = nil
+  local hb = _tWorld.habitatboundary
+  if hb ~= nil and hb.GetBoundaryObjectFromEntity ~= nil then
+    local bOk, bHit, oPanel, _, oProp = pcall(hb.GetBoundaryObjectFromEntity, hb, _nEnt)
+    if bOk and bHit then
+      if oProp == nil and oPanel ~= nil and oPanel.GetAllData ~= nil then
+        local bP, dP = pcall(oPanel.GetAllData, oPanel)
+        if bP and type(dP) == "table" then
+          oProp = dP.oAttachedProp
+        end
+      end
+      if oProp == nil then
+        return nil
+      end
+      if oProp.GetAllData ~= nil then
+        local bD, dProp = pcall(oProp.GetAllData, oProp)
+        if bD and type(dProp) == "table" then
+          nGateId = dProp.nEntityID or nGateId
+          sPropName = dProp.sPropType or dProp.sAttachablePropType or dProp.sType or dProp.sPrefabName or dProp.sName
+        end
+      end
+    end
+  end
+  if Presence.IsAquariumStaffDoorEntity ~= nil and Presence.IsAquariumStaffDoorEntity(nGateId) then
+    return nil
+  end
+  if type(sPropName) ~= "string" or sPropName == "" then
+    sPropName = ResolveEntityResourceName(_tWorld, nGateId) or ""
+  end
+  local sLow = string.lower(sPropName)
+  if string.find(sLow, "aquariumentrance", 1, true) ~= nil or string.find(sLow, "small", 1, true) ~= nil then
+    return nil
+  end
+  if string.find(sLow, "trackairlock", 1, true) ~= nil or string.find(sLow, "transportgate", 1, true) ~= nil then
+    return {id = nGateId, sMgVar = "GateOpen", nHalfW = 2.50, bIsGuest = false}
+  elseif string.find(sLow, "glasstunnel", 1, true) ~= nil then
+    return {id = nGateId, sMgVar = "GateState", nHalfW = 1.85, bIsGuest = true}
+  elseif string.find(sLow, "guestgate", 1, true) ~= nil then
+    return {id = nGateId, sMgVar = "GateState", nHalfW = 1.85, bIsGuest = true}
+  end
+  return {id = nGateId, sMgVar = "GateState", nHalfW = 1.75, bIsGuest = false}
+end
+
+local DriveAutoGateVisual = function(_tWorld, _nGateId, _sMgVar, _bOpen)
+  local attractions = _tWorld and _tWorld.attractions
+  local bUsedAttractions = false
+  if attractions ~= nil then
+    if _bOpen and attractions.RequestHabitatGateOpen ~= nil then
+      bUsedAttractions = pcall(attractions.RequestHabitatGateOpen, attractions, _nGateId)
+    elseif not _bOpen and attractions.ReleaseHabitatGateOpenRequest ~= nil then
+      bUsedAttractions = pcall(attractions.ReleaseHabitatGateOpenRequest, attractions, _nGateId)
+    end
+  end
+  -- Only drive motiongraph directly for track airlocks ("GateOpen") or if attractions API is absent;
+  -- forcing "GateState"="FullOpen" on standard habitat/guest gates desyncs visuals from gate physics.
+  local mg = _tWorld and _tWorld.motiongraph
+  if mg ~= nil and mg.SetVariable ~= nil and (_sMgVar == "GateOpen" or not bUsedAttractions) then
+    local val = (_sMgVar == "GateOpen") and (_bOpen == true) or (_bOpen and "FullOpen" or "Closed")
+    pcall(mg.SetVariable, mg, _nGateId, _sMgVar or "GateState", val)
+    if api.entity ~= nil and api.entity.FindEntityByName ~= nil then
+      for _, sChild in ipairs({"GateModel", "DoorModel", "Model"}) do
+        local bC, nChild = pcall(api.entity.FindEntityByName, sChild, _nGateId)
+        if bC and nChild ~= nil then
+          pcall(mg.SetVariable, mg, nChild, _sMgVar or "GateState", val)
+        end
+      end
+    end
+  end
+end
+
+-- Pure helper (exported for offline tests): returns true only when the vehicle is approaching / facing
+-- the door entrance (perpendicular to the wall & aimed toward the doorway), NOT when driving past parallel.
+Vehicles.ShouldAutoOpenDoor = function(_tVeh, _tDoor, _bCurrentlyOpen)
+  if type(_tVeh) ~= "table" or type(_tDoor) ~= "table" then
+    return false
+  end
+  local vx, vy, vz = _tVeh.x, _tVeh.y, _tVeh.z
+  local gx, gy, gz = _tDoor.gx, _tDoor.gy, _tDoor.gz
+  if not (IsFinite(vx) and IsFinite(vy) and IsFinite(vz) and IsFinite(gx) and IsFinite(gy) and IsFinite(gz)) then
+    return false
+  end
+  local nHalfW = _tDoor.nHalfW or 1.50
+  local gfx, gfz = _tDoor.fx or 0, _tDoor.fz or 1
+  local grx, grz = _tDoor.rx or gfz, _tDoor.rz or (-gfx)
+  local dx, dz = vx - gx, vz - gz
+  local nPerp = math.abs(dx * gfx + dz * gfz)
+  local nLat = math.abs(dx * grx + dz * grz)
+
+  if _bCurrentlyOpen then
+    -- Hysteresis: keep open while passing through until well clear.
+    return math.abs(vy - gy) <= 3.0 and nPerp <= c_nAutoGateCloseDist and nLat <= (nHalfW + 3.0)
+  end
+
+  if math.abs(vy - gy) > 2.5 or nPerp > c_nAutoGateOpenDist or nLat > (nHalfW + 1.0) then
+    return false
+  end
+  local vfx, vfz = _tVeh.fx or 0, _tVeh.fz or 1
+  -- Anti-parallel check: vehicle heading must align with the doorway's through-axis, not parallel to the wall.
+  local nAxisDot = math.abs(vfx * gfx + vfz * gfz)
+  if nAxisDot < 0.55 then
+    return false
+  end
+  -- Already right in the doorway threshold.
+  if nPerp <= 1.6 then
+    return true
+  end
+  -- Facing toward the entrance (or reversing toward it).
+  local nDist = math.sqrt(dx * dx + dz * dz)
+  if nDist < 1e-4 then
+    return true
+  end
+  local nToDot = (vfx * (-dx) + vfz * (-dz)) / nDist
+  if nToDot >= 0.50 then
+    return true
+  end
+  if (_tVeh.spd or 0) < -0.3 and (-nToDot) >= 0.50 then
+    return true
+  end
+  return false
+end
+
+-- Pure helper (exported for offline tests): true when vehicle is centered in an open wide doorway or cutout corridor.
+Vehicles.IsVehicleInPortalCorridor = function(_tVeh, _tPortal)
+  if type(_tVeh) ~= "table" or type(_tPortal) ~= "table" then
+    return false
+  end
+  local nHalfW = _tPortal.nHalfW or 0
+  if nHalfW < c_nMinPassableHalfW then
+    return false
+  end
+  local vx, vy, vz = _tVeh.x, _tVeh.y, _tVeh.z
+  local gx, gy, gz = _tPortal.gx, _tPortal.gy, _tPortal.gz
+  if not (IsFinite(vx) and IsFinite(vy) and IsFinite(vz) and IsFinite(gx) and IsFinite(gy) and IsFinite(gz)) then
+    return false
+  end
+  if math.abs(vy - gy) > 2.5 then
+    return false
+  end
+  local dx, dz = vx - gx, vz - gz
+  if _tPortal.bRadial then
+    local nR = nHalfW + c_nPortalPassLatPad
+    return (dx * dx + dz * dz) <= (nR * nR)
+  end
+  local fx, fz = _tPortal.fx or 0, _tPortal.fz or 1
+  local rx, rz = _tPortal.rx or fz, _tPortal.rz or (-fx)
+  local nPerp = math.abs(dx * fx + dz * fz)
+  local nLat = math.abs(dx * rx + dz * rz)
+  return nPerp <= c_nPortalPassPerp and nLat <= (nHalfW + c_nPortalPassLatPad)
+end
+
+local RestoreVehicleIgnoredCollisions = function(_nVehicle)
+  if s.bVehPortalGhost and s.nVehPhysEnt ~= nil then
+    local p = api.physics
+    if p ~= nil and p.SetCollisionEnabled ~= nil then
+      pcall(p.SetCollisionEnabled, s.nVehPhysEnt, true)
+    end
+  end
+  s.bVehPortalGhost = false
+  if _nVehicle == nil or _nVehicle == s.nVehPhysFor then
+    s.nVehPhysEnt = nil
+    s.nVehPhysFor = nil
+  end
+end
+
+local ReleaseAutoGate = function(_sReason)
+  if s.tAutoOpenGate == nil then
     return
   end
-  local nGate = s.nAutoOpenGate
-  s.nAutoOpenGate = nil
+  local tG = s.tAutoOpenGate
+  s.tAutoOpenGate = nil
   pcall(function()
     local tWorld = WorldAPIs()
-    if tWorld ~= nil and tWorld.attractions ~= nil and tWorld.attractions.ReleaseHabitatGateOpenRequest ~= nil then
-      tWorld.attractions:ReleaseHabitatGateOpenRequest(nGate)
+    DriveAutoGateVisual(tWorld, tG.id, tG.sMgVar, false)
+    if (Bridge.IsPeerConnected() or Bridge.IsLoopback()) and IsFinite(tG.gx) then
+      Bridge.SendPacket(c_nVehicleEventPacket, nil, {
+        k = "action", op = "gate", open = false,
+        x = math.floor(tG.gx * 100 + 0.5), y = math.floor(tG.gy * 100 + 0.5), z = math.floor(tG.gz * 100 + 0.5),
+      })
     end
-    local vPos = nil
-    if tWorld ~= nil and tWorld.transform ~= nil then
-      local tr = tWorld.transform:CalculateWorldTransform(nGate)
-      vPos = tr and (tr.GetPos and tr:GetPos() or tr:Pos())
-    end
-    if vPos ~= nil and (Bridge.IsPeerConnected() or Bridge.IsLoopback()) then
-      local gx, gy, gz = ReadVec3(vPos)
-      if gx ~= nil then
-        Bridge.SendPacket(c_nVehicleEventPacket, nil, {
-          k = "action", op = "gate", open = false,
-          x = math.floor(gx * 100 + 0.5), y = math.floor(gy * 100 + 0.5), z = math.floor(gz * 100 + 0.5),
-        })
-      end
+    if _sReason ~= nil then
+      Log("released gate id=" .. tostring(tG.id) .. " (" .. tostring(_sReason) .. ")")
     end
   end)
 end
@@ -765,56 +997,226 @@ local StepAutoGates = function(_nVehicle)
   pcall(function()
     local tWorld = WorldAPIs()
     local trApi = tWorld and tWorld.transform
-    local fpi = tWorld and tWorld.FirstPersonInteraction
-    local attractions = tWorld and tWorld.attractions
-    if trApi == nil or fpi == nil or type(fpi.tEntities) ~= "table" or attractions == nil then
+    if trApi == nil then
       return
     end
     local trVeh = trApi:CalculateWorldTransform(_nVehicle)
-    local vx, vy, vz = ReadVec3(trVeh and (trVeh.GetPos and trVeh:GetPos() or trVeh:Pos()))
+    local vx, vy, vz, vfx, vfz = ExtractPortalBasis(trVeh)
     if vx == nil then
       return
     end
-    -- Check if currently auto-opened gate is now far enough behind us to release.
-    if s.nAutoOpenGate ~= nil then
-      local trG = trApi:CalculateWorldTransform(s.nAutoOpenGate)
-      local gx, gy, gz = ReadVec3(trG and (trG.GetPos and trG:GetPos() or trG:Pos()))
-      if gx == nil or ((gx - vx) ^ 2 + (gz - vz) ^ 2) > (c_nAutoGateCloseDist * c_nAutoGateCloseDist) then
-        ReleaseAutoGate()
-      else
+    local nSpd = (tWorld.vehicles and tWorld.vehicles.GetVehicleSpeed and tWorld.vehicles:GetVehicleSpeed(_nVehicle)) or 0
+    local tVeh = {x = vx, y = vy, z = vz, fx = vfx, fz = vfz, spd = nSpd}
+
+    -- Keep currently auto-opened gate open until vehicle clears its corridor.
+    -- Periodically renew the attractions gate-open request (release + re-request to keep refcount balanced)
+    -- so creeping slowly or waiting in front of the door never lets the gate's physics blocker re-engage.
+    if s.tAutoOpenGate ~= nil then
+      if Vehicles.ShouldAutoOpenDoor(tVeh, s.tAutoOpenGate, true) then
+        local nNow = s.nClock or 0
+        if (nNow - (s.tAutoOpenGate.nRenewAt or 0)) >= 3.0 then
+          s.tAutoOpenGate.nRenewAt = nNow
+          local attractions = tWorld and tWorld.attractions
+          if attractions ~= nil and attractions.RequestHabitatGateOpen ~= nil then
+            if attractions.ReleaseHabitatGateOpenRequest ~= nil then
+              pcall(attractions.ReleaseHabitatGateOpenRequest, attractions, s.tAutoOpenGate.id)
+            end
+            pcall(attractions.RequestHabitatGateOpen, attractions, s.tAutoOpenGate.id)
+          end
+        end
         return
       end
+      local g = s.tAutoOpenGate
+      local dx, dz = vx - (g.gx or 0), vz - (g.gz or 0)
+      local nPerp = math.abs(dx * (g.fx or 0) + dz * (g.fz or 1))
+      local nLat = math.abs(dx * (g.rx or 1) + dz * (g.rz or 0))
+      ReleaseAutoGate(string.format("cleared perp=%.2f lat=%.2f dy=%.2f", nPerp, nLat, math.abs(vy - (g.gy or 0))))
     end
-    local nBestGate, nBestD2, vBestPos = nil, c_nAutoGateOpenDist * c_nAutoGateOpenDist, nil
-    for nEnt, tInfo in pairs(fpi.tEntities) do
-      if type(tInfo) == "table" and tInfo.sType == "HabitatGate" then
-        local nGateId = tInfo.nParentEntityID or nEnt
-        if not (Presence.IsAquariumStaffDoorEntity ~= nil and Presence.IsAquariumStaffDoorEntity(nGateId)) then
-          local trG = trApi:CalculateWorldTransform(nGateId)
-          local gx, gy, gz = ReadVec3(trG and (trG.GetPos and trG:GetPos() or trG:Pos()))
-          if gx ~= nil and math.abs(gy - vy) <= 2.5 then
-            local d2 = (gx - vx) ^ 2 + (gz - vz) ^ 2
-            if d2 < nBestD2 then
-              nBestD2 = d2
-              nBestGate = nGateId
-              vBestPos = {x = gx, y = gy, z = gz}
+
+    local tCandidates = {}
+    local tSeen = {}
+    local AddCandidate = function(_nEnt)
+      if _nEnt == nil or tSeen[_nEnt] then
+        return
+      end
+      local tInfo = ClassifyVehicleAutoGate(tWorld, _nEnt)
+      if tInfo == nil or tSeen[tInfo.id] then
+        return
+      end
+      tSeen[_nEnt] = true
+      tSeen[tInfo.id] = true
+      local trG = trApi:CalculateWorldTransform(tInfo.id)
+      local gx, gy, gz, gfx, gfz, grx, grz = ExtractPortalBasis(trG)
+      if gx ~= nil then
+        tInfo.gx, tInfo.gy, tInfo.gz = gx, gy, gz
+        tInfo.fx, tInfo.fz, tInfo.rx, tInfo.rz = gfx, gfz, grx, grz
+        table.insert(tCandidates, tInfo)
+      end
+    end
+
+    -- 1. Spatial Flag_HabitatBoundary query catches GuestGate, GlassTunnelGate, TrackAirlock, TransportGate, etc.
+    local sp = tWorld.spatial
+    if sp ~= nil and sp.SphereQuery ~= nil and sp.Flag_HabitatBoundary ~= nil then
+      local bQ, tHits = pcall(sp.SphereQuery, sp, Vector3:new(vx, vy + 1.0, vz), c_nAutoGateOpenDist + 2.0,
+        sp.Flag_HabitatBoundary, 0, 32)
+      if bQ and type(tHits) == "table" then
+        for _, nEnt in ipairs(tHits) do
+          AddCandidate(nEnt)
+        end
+      end
+    end
+
+    -- 2. Vanilla FirstPersonInteraction HabitatGate entries.
+    local fpi = tWorld.FirstPersonInteraction
+    if fpi ~= nil and type(fpi.tEntities) == "table" then
+      for nEnt, tInfo in pairs(fpi.tEntities) do
+        if type(tInfo) == "table" and tInfo.sType == "HabitatGate" then
+          AddCandidate(tInfo.nParentEntityID or nEnt)
+        end
+      end
+    end
+
+    local tBest, nBestD2 = nil, math.huge
+    for _, tDoor in ipairs(tCandidates) do
+      if Vehicles.ShouldAutoOpenDoor(tVeh, tDoor, false) then
+        local d2 = (tDoor.gx - vx) ^ 2 + (tDoor.gz - vz) ^ 2
+        if d2 < nBestD2 then
+          nBestD2 = d2
+          tBest = tDoor
+        end
+      end
+    end
+
+    if tBest ~= nil then
+      tBest.nRenewAt = s.nClock or 0
+      s.tAutoOpenGate = tBest
+      DriveAutoGateVisual(tWorld, tBest.id, tBest.sMgVar, true)
+      if Bridge.IsPeerConnected() or Bridge.IsLoopback() then
+        Bridge.SendPacket(c_nVehicleEventPacket, nil, {
+          k = "action", op = "gate", open = true,
+          x = math.floor(tBest.gx * 100 + 0.5),
+          y = math.floor(tBest.gy * 100 + 0.5),
+          z = math.floor(tBest.gz * 100 + 0.5),
+        })
+      end
+      Log(string.format("auto-opened %s (id=%s pos=(%.1f,%.1f) f=(%.2f,%.2f) halfW=%.2f)",
+        tBest.bIsGuest and "guest door" or "habitat gate", tostring(tBest.id),
+        tBest.gx or 0, tBest.gz or 0, tBest.fx or 0, tBest.fz or 1, tBest.nHalfW or 0))
+    end
+  end)
+end
+
+-- Allows the driving vehicle to pass cleanly through opened large doors / guest doors and wide entrance
+-- cutouts on habitat walls by temporarily disabling collision on the vehicle's own chassis physics body
+-- (wheels still support the buggy on terrain via Flag_Landscape raycasts!) strictly while aligned inside
+-- the opening corridor, and restoring it immediately once cleared. Closed doors, solid side walls, and
+-- animal habitat containment remain 100% solid.
+local StepVehiclePortalPassThrough = function(_nVehicle)
+  if s.nLocalSeat ~= 1 or _nVehicle == nil then
+    RestoreVehicleIgnoredCollisions(_nVehicle)
+    return
+  end
+  local p = api.physics
+  if p == nil or p.SetCollisionEnabled == nil then
+    return
+  end
+  pcall(function()
+    local tWorld = WorldAPIs()
+    local trApi = tWorld and tWorld.transform
+    if trApi == nil then
+      return
+    end
+    local trVeh = trApi:CalculateWorldTransform(_nVehicle)
+    local vx, vy, vz, vfx, vfz = ExtractPortalBasis(trVeh)
+    if vx == nil then
+      return
+    end
+    -- Resolve and cache the vehicle's own Flag_Car_OffTrack physics body while collision is enabled.
+    if s.nVehPhysFor ~= _nVehicle then
+      RestoreVehicleIgnoredCollisions(s.nVehPhysFor)
+      s.nVehPhysFor = _nVehicle
+      s.nVehPhysEnt = nil
+    end
+    if s.nVehPhysEnt == nil and not s.bVehPortalGhost and p.SphereSweep ~= nil then
+      local nPhys = api.entity ~= nil and api.entity.FindEntityByName ~= nil and
+        api.entity.FindEntityByName("MainPhysicsWorld") or nil
+      local nCarFlag = p.Flag_Car_OffTrack or 0
+      if nPhys ~= nil and nCarFlag ~= 0 then
+        local bV, tVHits = pcall(p.SphereSweep, nPhys,
+          Vector3:new(vx, vy + 4.5, vz), Vector3:new(vx, vy + 0.1, vz), 0.35, nCarFlag, 4)
+        if bV and type(tVHits) == "table" and #tVHits > 0 and type(tVHits[1]) == "table" then
+          s.nVehPhysEnt = tVHits[1].nEntityID or tVHits[1].entityID
+        end
+      end
+    end
+
+    local tVeh = {x = vx, y = vy, z = vz, fx = vfx, fz = vfz}
+    local bInPortal = false
+
+    -- 1. Auto-opened gate/guest door.
+    if s.tAutoOpenGate ~= nil and Vehicles.IsVehicleInPortalCorridor(tVeh, s.tAutoOpenGate) then
+      bInPortal = true
+    end
+
+    -- 2. Manually opened large doors / guest gates registered in Presence.
+    if not bInPortal then
+      local tOpenPortals = Presence.GetOpenPortals and Presence.GetOpenPortals() or nil
+      if type(tOpenPortals) == "table" then
+        for _, tP in pairs(tOpenPortals) do
+          if Vehicles.IsVehicleInPortalCorridor(tVeh, tP) then
+            bInPortal = true
+            break
+          end
+        end
+      end
+    end
+
+    -- 3. Wide entrance cutouts / archways / door frames on or near habitat walls (not blocked by a closed door).
+    if not bInPortal then
+      local sp = tWorld.spatial
+      if sp ~= nil and sp.SphereQuery ~= nil and Presence.ClassifyCutoutResource ~= nil then
+        local nFlags = (sp.Flag_Scenery or 0) | (sp.Flag_NonStaticScenery or 0) | (sp.Flag_Facility or 0)
+        if nFlags ~= 0 then
+          local bQ, tHits = pcall(sp.SphereQuery, sp, Vector3:new(vx, vy + 1.0, vz), 6.5, nFlags, 0, 24)
+          if bQ and type(tHits) == "table" then
+            for _, nEnt in ipairs(tHits) do
+              local sName = ResolveEntityResourceName(tWorld, nEnt)
+              local tDim = Presence.ClassifyCutoutResource(sName)
+              if tDim ~= nil and (tDim.nHalfW or 0) >= c_nMinPassableHalfW then
+                local trC = trApi:CalculateWorldTransform(nEnt)
+                local gx, gy, gz, fx, fz, rx, rz = ExtractPortalBasis(trC)
+                if gx ~= nil and not (Presence.HasClosedDoorAt ~= nil and Presence.HasClosedDoorAt(gx, gy, gz)) then
+                  local tCut = {
+                    gx = gx, gy = gy, gz = gz,
+                    fx = fx, fz = fz, rx = rx, rz = rz,
+                    nHalfW = tDim.nHalfW, nHalfDepth = tDim.nHalfDepth,
+                  }
+                  if Vehicles.IsVehicleInPortalCorridor(tVeh, tCut) then
+                    bInPortal = true
+                    break
+                  end
+                end
+              end
             end
           end
         end
       end
     end
-    if nBestGate ~= nil and attractions.RequestHabitatGateOpen ~= nil then
-      s.nAutoOpenGate = nBestGate
-      attractions:RequestHabitatGateOpen(nBestGate)
-      if vBestPos ~= nil and (Bridge.IsPeerConnected() or Bridge.IsLoopback()) then
-        Bridge.SendPacket(c_nVehicleEventPacket, nil, {
-          k = "action", op = "gate", open = true,
-          x = math.floor(vBestPos.x * 100 + 0.5),
-          y = math.floor(vBestPos.y * 100 + 0.5),
-          z = math.floor(vBestPos.z * 100 + 0.5),
-        })
+
+    if s.nVehPhysEnt ~= nil then
+      if bInPortal then
+        -- Re-assert every frame while inside an open portal corridor so engine physics/vehicle ticks
+        -- cannot silently restore collision when creeping slowly or waiting in front of an open door.
+        pcall(p.SetCollisionEnabled, s.nVehPhysEnt, false)
       end
-      Log("auto-opened habitat gate (id=" .. tostring(nBestGate) .. ") for driving vehicle")
+      if bInPortal ~= s.bVehPortalGhost then
+        s.bVehPortalGhost = bInPortal
+        if not bInPortal then
+          pcall(p.SetCollisionEnabled, s.nVehPhysEnt, true)
+        end
+        Log("portal pass-through chassis collision " .. (bInPortal and "DISABLED" or "RESTORED") ..
+          " (vehPhys=" .. tostring(s.nVehPhysEnt) .. ")")
+      end
     end
   end)
 end
@@ -1305,6 +1707,7 @@ Vehicles.SwapToSeat = function(_nTargetSeat)
   AssignPeerToSeat("local", nTarget, tSession and tSession.sSelf or "You")
   if nPrev == 1 then
     ReleaseAutoGate()
+    RestoreVehicleIgnoredCollisions(s.nVehicle)
   end
   ApplyLocalSeatMode(s.tDriveModeSelf, nPrev, nTarget)
   PlayUiSound("gui_click")
@@ -1595,6 +1998,7 @@ local InstallDriveModeWrap = function()
     local bToPhoto = s.bInPhotoFromVehicle == true
     if not bToPhoto then
       ReleaseAutoGate()
+      RestoreVehicleIgnoredCollisions(self.nVehicle)
       if Presence.SetVehicleOwnOverride ~= nil then
         Presence.SetVehicleOwnOverride(nil)
       end
@@ -1655,8 +2059,9 @@ local InstallDriveModeWrap = function()
       if s.nLocalSeat ~= nil and s.nLocalSeat ~= 1 then
         SyncOwnPassengerAvatar(self.nVehicle)
       end
-      -- Auto-open safari/habitat gates when driving.
+      -- Auto-open guest/safari/habitat gates when facing the entrance & enable portal pass-through.
       StepAutoGates(self.nVehicle)
+      StepVehiclePortalPassThrough(self.nVehicle)
       -- Reinforce manual ON headlight state vs daytime NightLighting.
       StepNativeHeadlights(self.nVehicle)
     end)
@@ -2032,11 +2437,20 @@ Vehicles.Install = function()
   if Presence.SetVehiclePromptProvider ~= nil then
     Presence.SetVehiclePromptProvider(Vehicles.FindClosestSeatPrompt)
   end
+  -- Remove car-specific forced boundaries (4..25 m lookahead auto-brake & habitat keep-out)
+  -- in Sandbox/Challenge/Career parks while leaving real physical wall collisions intact.
+  if Bridge.SendCommand ~= nil then
+    Bridge.SendCommand("veh_bounds", {remove = "1"})
+  end
   Log("installed")
 end
 
 Vehicles.Uninstall = function()
+  if Bridge.SendCommand ~= nil then
+    Bridge.SendCommand("veh_bounds", {remove = "0"})
+  end
   ReleaseAutoGate()
+  RestoreVehicleIgnoredCollisions(s.nVehicle)
   ReleaseHeadlightDisableClaims()
   if Presence.SetVehiclePromptProvider ~= nil then
     Presence.SetVehiclePromptProvider(nil)
@@ -2066,6 +2480,7 @@ end
 
 Vehicles.Reset = function()
   ReleaseAutoGate()
+  RestoreVehicleIgnoredCollisions(s.nVehicle)
   ReleaseHeadlightDisableClaims()
   s.nVehicle = nil
   s.bHasVehicle = false

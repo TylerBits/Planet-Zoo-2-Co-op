@@ -123,6 +123,14 @@ limit (`k_EResultLimitExceeded`) wait in an ordered backlog instead of being dro
 Payload: UTF-8 JSON object, optionally followed by `0x00` and a binary attachment (e.g. a blueprint
 file for `ACTION_PLACE_OBJECT`, whose JSON is `{"x":cm,"y":cm,"z":cm}` = AABB centre of the group).
 
+`ACTION_PLACE_OBJECT` premade blueprint (`k = "bp"`, no attachment) `[IMPLEMENTED]` (offline-tested):
+`{k = "bp", id = game database blueprintID, x, y, z (cm), yaw, pitch, roll (rad)}` = the transform the
+blueprint tool committed. The receiver resolves `id` through its own `Blueprints` database
+(`BlueprintPlacementMode._GetBlueprintFileFromDatabase`) and places that file, so the copy keeps habitat, roof
+net, decoration, water and the premade's terrain edits. For a few seconds around the commit, its pieces are not
+also sent as groups, fence/path regions or lakes (`BuildSync.IsPremadeQuiet`). An unknown `id` (partner lacks
+the DLC) places nothing.
+
 ### `LEDGER_SYNC_1HZ` (Channel 1 — 20 Bytes) `[IMPLEMENTED]` cash + game speed + time of day; CC `[PLANNED]`
 
 ```cpp

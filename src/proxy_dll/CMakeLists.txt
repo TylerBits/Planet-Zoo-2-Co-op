@@ -23,7 +23,7 @@ if(PZ2COOP_DEV_DIAG)
 endif()
 
 # Networking + IPC core, shared by the DLL and the self-test.
-add_library(pz2coop_core STATIC steam_p2p.cpp file_bridge.cpp mem_bridge.cpp diag.cpp ipc_bridge.cpp ui_overlay.cpp)
+add_library(pz2coop_core STATIC steam_p2p.cpp file_bridge.cpp mem_bridge.cpp diag.cpp ipc_bridge.cpp ui_overlay.cpp vehicle_patch.cpp)
 target_link_libraries(pz2coop_core PUBLIC ws2_32 bcrypt crypt32)
 
 # The proxy itself: drop version.dll next to PlanetZoo2.exe.

@@ -41,6 +41,10 @@ local Vector3 = require("Vector3")
 local TransformQ = require("TransformQ")
 local Bridge = require("PZ2Coop.Bridge")
 local BuildSync = require("PZ2Coop.BuildSync")
+-- Pure helpers live in pz2coop.regionsync_logic.lua; every call goes through this table, so a dev hot swap
+-- (tools/test_live_game.py --hot-logic) replaces them in place.
+require("PZ2Coop.RegionSync_Logic")
+local Logic = global.rawget(global, "__PZ2CoopRegionSyncLogic")
 
 local RegionSync = module(...)
 
@@ -50,7 +54,6 @@ local c_nQuiet = 0.4 -- seconds without new changes before a settled region is s
 local c_nQuietUnsettled = 1.5 -- tools that commit through a cached undo API never "settle": wait longer
 local c_nIgnoreAfterApply = 1.5 -- changes caused by applying a remote region are not sent back
 local c_nStartupIgnore = 5.0 -- the park load reports every path/fence once
-local c_nMaxRegionM = 400 -- larger "changes" are park-wide refreshes, not edits
 local c_nMaxEntities = 4000
 local c_nParentDepth = 4
 local c_nDriftToleranceCm = 2
@@ -89,67 +92,16 @@ local Log = function(_s)
   end
 end
 
-local Cm = function(_n)
-  return math.floor(_n * 100 + 0.5)
-end
-
-local HasFlag = function(_nFlags, _nBit)
-  local bOk, bHas = pcall(function()
-    return (math.tointeger(_nFlags) & math.tointeger(_nBit)) ~= 0
-  end)
-  return bOk and bHas
-end
-
-local Vec3 = function(_v)
-  local bOk, x, y, z = pcall(function()
-    return _v:GetX(), _v:GetY(), _v:GetZ()
-  end)
-  if bOk and type(x) == "number" and type(y) == "number" and type(z) == "number" then
-    return x, y, z
-  end
-  return nil
-end
+local Cm = function(...) return Logic.Cm(...) end
+local HasFlag = function(...) return Logic.HasFlag(...) end
+local Vec3 = function(...) return Logic.Vec3(...) end
 
 -- ---- boxes (metres) --------------------------------------------------------------------------------------
-local Grow = function(_t, _vMin, _vMax)
-  local x0, y0, z0 = Vec3(_vMin)
-  local x1, y1, z1 = Vec3(_vMax)
-  if x0 == nil or x1 == nil then
-    return _t
-  end
-  if x1 - x0 > c_nMaxRegionM or z1 - z0 > c_nMaxRegionM then
-    return _t
-  end
-  if _t == nil then
-    return {x0 = x0, y0 = y0, z0 = z0, x1 = x1, y1 = y1, z1 = z1}
-  end
-  _t.x0, _t.y0, _t.z0 = math.min(_t.x0, x0), math.min(_t.y0, y0), math.min(_t.z0, z0)
-  _t.x1, _t.y1, _t.z1 = math.max(_t.x1, x1), math.max(_t.y1, y1), math.max(_t.z1, z1)
-  return _t
-end
-
-local BoxUnion = function(_a, _b)
-  if _a == nil then
-    return _b
-  end
-  if _b == nil then
-    return _a
-  end
-  return {x0 = math.min(_a.x0, _b.x0), y0 = math.min(_a.y0, _b.y0), z0 = math.min(_a.z0, _b.z0),
-    x1 = math.max(_a.x1, _b.x1), y1 = math.max(_a.y1, _b.y1), z1 = math.max(_a.z1, _b.z1)}
-end
-
-local Expand = function(_r, _n)
-  return {x0 = _r.x0 - _n, y0 = _r.y0 - _n, z0 = _r.z0 - _n, x1 = _r.x1 + _n, y1 = _r.y1 + _n, z1 = _r.z1 + _n}
-end
-
-local Shift = function(_r, _nDx)
-  return {x0 = _r.x0 + _nDx, y0 = _r.y0, z0 = _r.z0, x1 = _r.x1 + _nDx, y1 = _r.y1, z1 = _r.z1}
-end
-
-local RegionText = function(_r)
-  return string.format("(%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f)", _r.x0, _r.y0, _r.z0, _r.x1, _r.y1, _r.z1)
-end
+local Grow = function(...) return Logic.Grow(...) end
+local BoxUnion = function(...) return Logic.BoxUnion(...) end
+local Expand = function(...) return Logic.Expand(...) end
+local Shift = function(...) return Logic.Shift(...) end
+local RegionText = function(...) return Logic.RegionText(...) end
 
 local ShapeBox = function(_nEntity)
   if _nEntity == nil then
@@ -164,13 +116,8 @@ local ShapeBox = function(_nEntity)
   return Grow(nil, vMin, vMax)
 end
 
-local Overlaps = function(_a, _b)
-  return _a.x0 <= _b.x1 and _a.x1 >= _b.x0 and _a.y0 <= _b.y1 and _a.y1 >= _b.y0 and _a.z0 <= _b.z1 and _a.z1 >= _b.z0
-end
-
-local Centre = function(_t)
-  return {x = Cm((_t.x0 + _t.x1) / 2), y = Cm((_t.y0 + _t.y1) / 2), z = Cm((_t.z0 + _t.z1) / 2)}
-end
+local Overlaps = function(...) return Logic.Overlaps(...) end
+local Centre = function(...) return Logic.Centre(...) end
 
 -- Echo suppression by area: only changes overlapping a just-applied remote area are dropped, so the player's
 -- own next stroke elsewhere is still sent (a global 1.5 s window lost half a path circle, diag.log 2026-11-27).
@@ -285,13 +232,8 @@ end
 
 -- Path volume chunks in the region, in an editors multi-selection (the container vanilla saves and deletes
 -- from), their union box and each chunk's box (from the raw hit, which has the spatial shape).
--- _rInside (receiver only): skip chunks reaching more than c_nInsideTolM outside it. Deleting a whole chunk
--- that sticks out of the area removes path the sender never re-sent (the "disconnected path" after a delete).
-local c_nInsideTolM = 1.0
+-- _rInside (receiver only): skip chunks reaching more than Logic.c_nInsideTolM outside it (Logic.PlanPathChunks).
 local c_nWholeChunkM = 20 -- shortcut: chunks longer than this past the area edge look smaller; raise if paths still break
-local Inside = function(_a, _b)
-  return _a.x0 >= _b.x0 and _a.x1 <= _b.x1 and _a.z0 >= _b.z0 and _a.z1 <= _b.z1
-end
 
 local QueryPathChunks = function(_r, _rInside)
   local tWorldAPIs = api.world.GetWorldAPIs()
@@ -328,40 +270,12 @@ local QueryPathChunks = function(_r, _rInside)
       tMiss = tTried
     end
   end
-  if _rInside == nil then
-    -- Sender: also send every chunk lying inside the grown area, until no more fit. The receiver replaces all
-    -- its chunks inside that area; one the sender left out (it did not touch the change box) was deleted
-    -- there and never came back: the gaps in a freshly drawn loop (play test 2026-11-27 14:56).
-    local rArea = _r
-    for _, nChunk in ipairs(tOrder) do
-      rArea = BoxUnion(rArea, tWholeByChunk[nChunk] or tBoxByChunk[nChunk] or nil)
-    end
-    local nAdded, bGrew, nPass = 0, true, 0
-    while bGrew and nPass < 5 do
-      bGrew, nPass = false, nPass + 1
-      local rFit = Expand(rArea, c_nInsideTolM)
-      for nChunk, tWhole in pairs(tWholeByChunk) do
-        if tBoxByChunk[nChunk] == nil and Inside(tWhole, rFit) then
-          table.insert(tOrder, nChunk)
-          tBoxByChunk[nChunk] = tWhole
-          rArea = BoxUnion(rArea, tWhole)
-          nAdded, bGrew = nAdded + 1, true
-        end
-      end
-    end
-    if nAdded > 0 then
-      Log("path query: added " .. nAdded .. " chunk(s) lying inside the area")
-    end
+  local tSelect, nAdded, nKept = Logic.PlanPathChunks(_r, _rInside, tOrder, tBoxByChunk, tWholeByChunk, ShapeBox)
+  if nAdded > 0 then
+    Log("path query: added " .. nAdded .. " chunk(s) lying inside the area")
   end
-  local rTol = _rInside and Expand(_rInside, c_nInsideTolM) or nil
-  local nKept = 0
-  for _, nChunk in ipairs(tOrder) do
-    local tWhole = tWholeByChunk[nChunk] or ShapeBox(nChunk)
-    if rTol ~= nil and tWhole ~= nil and not Inside(tWhole, rTol) then
-      nKept = nKept + 1
-    else
-      pcall(function() ms:AddEntity(nChunk) end)
-    end
+  for _, nChunk in ipairs(tSelect) do
+    pcall(function() ms:AddEntity(nChunk) end)
   end
   if nKept > 0 then
     Log("path query: kept " .. nKept .. " own chunk(s) reaching outside the area")
@@ -455,6 +369,35 @@ local QueryFencePieces = function(_r)
     end
   end
   return tPosts, tPanels, tHabitats, #tPairs, tProps, tPillars, tRoofs
+end
+
+-- Only the roofs (aviary nets) of habitats whose fences are being replaced. A roof spans its whole habitat, so
+-- an area query also hits a neighbour's net; removing that one deleted the host's net under the solo mirror.
+local RoofsOfFences = function(_tRoofs, _tPosts, _tPanels)
+  local api_hb = api.world.GetWorldAPIs().habitatboundary
+  local tHabs = {}
+  for _, tSet in ipairs({_tPosts, _tPanels}) do
+    for _, o in pairs(tSet or {}) do
+      pcall(function()
+        for nHabID in pairs(api_hb:GetHabitatsFromBoundaryObject(o) or {}) do
+          tHabs[nHabID] = true
+        end
+      end)
+    end
+  end
+  local tKeep, nDropped = {}, 0
+  for nRoof in pairs(_tRoofs or {}) do
+    local bOk, nHabID = pcall(function() return api_hb:GetRoofHabitat(nRoof) end)
+    if bOk and nHabID ~= nil and tHabs[nHabID] then
+      tKeep[nRoof] = true
+    else
+      nDropped = nDropped + 1
+    end
+  end
+  if nDropped > 0 then
+    Log("kept " .. nDropped .. " roof(s) of habitats whose fences are not replaced")
+  end
+  return tKeep
 end
 
 local BuildBoundarySelection = function(_tPosts, _tPanels, _tProps, _tPillars, _tRoofs)
@@ -658,9 +601,7 @@ local ParkLoadSaveManager = function()
   return api.game.GetEnvironment():RequireInterface("Interfaces.IParkLoadSaveManager")
 end
 
-local ExpandY = function(_r, _nExtraY)
-  return {x0 = _r.x0, y0 = _r.y0 - _nExtraY, z0 = _r.z0, x1 = _r.x1, y1 = _r.y1 + _nExtraY, z1 = _r.z1}
-end
+local ExpandY = function(...) return Logic.ExpandY(...) end
 
 local MoveObjectPos = function(_moveObject)
   local bOk, vPos = pcall(function() return _moveObject:GetPosition() end)
@@ -1067,15 +1008,9 @@ local Job_SendFence = function(_r)
 end
 
 -- ---- incoming --------------------------------------------------------------------------------------------
-local RegionFromData = function(_t)
-  return {x0 = _t.x0 / 100, y0 = _t.y0 / 100, z0 = _t.z0 / 100, x1 = _t.x1 / 100, y1 = _t.y1 / 100, z1 = _t.z1 / 100}
-end
-
+local RegionFromData = function(...) return Logic.RegionFromData(...) end
 -- wp = 1: the blueprint is placed where it was saved (+ ox, + the kdy height fix), not re-targeted to cx/cy/cz.
-local TargetOf = function(_tData)
-  return {x = _tData.cx + (_tData.ox or 0), y = _tData.cy, z = _tData.cz, by0 = _tData.by0,
-    bKeep = _tData.wp == 1, ox = _tData.ox or 0, dy = _tData.kdy or 0}
-end
+local TargetOf = function(...) return Logic.TargetOf(...) end
 
 -- Bottom of the path pieces that are new since tOld, minus the sender's bottom (cm); nil if none visible.
 local MeasurePathDy = function(_r, _tOld, _nBy0, _sRoute)
@@ -1200,6 +1135,7 @@ local Job_ApplyFence = function(_sFile, _tData)
   BuildSync.Breadcrumb("apply fence region " .. RegionText(r) .. ": query own fences")
   local tPosts, tPanels, _, _, tProps, tPillars, tRoofs = QueryFencePieces(ExpandY(r, 12))
   CollectConnected(tPosts, tPanels)
+  tRoofs = RoofsOfFences(tRoofs, tPosts, tPanels)
   local selection, nOld = BuildBoundarySelection(tPosts, tPanels, tProps, tPillars, tRoofs)
   local tOldHabs = SnapshotHabitatEntities()
   local tOldRaw = RawSet(ExpandY(r, 40), s.tFlags.fence)
@@ -1336,13 +1272,7 @@ local Job_ApplyFence = function(_sFile, _tData)
 end
 
 -- "Aquarium" habitats use acrylic panels; Glass / Glass_One_Way / Brick / etc. belong to Standard barriers.
-local HabitatTypeFor = function(_sBoundaryType)
-  local sType = string.lower(tostring(_sBoundaryType))
-  if string.find(sType, "acrylic", 1, true) then
-    return "Aquarium"
-  end
-  return "Standard"
-end
+local HabitatTypeFor = function(...) return Logic.HabitatTypeFor(...) end
 
 local c_tPosVectorKeys = {
   vPos = true,
@@ -1357,21 +1287,9 @@ local c_tDirVectorKeys = {
   vDirEnd = true,
 }
 
-local IsFiniteNum = function(_n)
-  return type(_n) == "number" and _n == _n and _n > -1e7 and _n < 1e7
-end
-
-local IsSafeBoundaryType = function(_v)
-  return type(_v) == "string" and #_v > 0 and #_v <= 64 and string.match(_v, "^[%w_]+$") ~= nil
-end
-
-local NormDir = function(_x, _y, _z)
-  local len = math.sqrt(_x * _x + _y * _y + _z * _z)
-  if len > 1e-5 then
-    return _x / len, _y / len, _z / len
-  end
-  return 0, 0, 1
-end
+local IsFiniteNum = function(...) return Logic.IsFiniteNum(...) end
+local IsSafeBoundaryType = function(...) return Logic.IsSafeBoundaryType(...) end
+local NormDir = function(...) return Logic.NormDir(...) end
 
 local Unpack = function(_t, _nDx)
   local tData = {}
@@ -1446,6 +1364,7 @@ local Job_ApplyFencePieces = function(_tData)
   local r = Shift(RegionFromData(_tData), nDx)
   local tPosts, tPanels, _, _, tProps, tPillars, tRoofs = QueryFencePieces(r)
   CollectConnected(tPosts, tPanels)
+  tRoofs = RoofsOfFences(tRoofs, tPosts, tPanels)
   local selection, nOld = BuildBoundarySelection(tPosts, tPanels, tProps, tPillars, tRoofs)
   s.nIgnoreFenceUntil = s.nClock + 1e9
   BuildSync.Breadcrumb("apply open fence " .. RegionText(r) .. ": remove " .. nOld .. ", add " .. #_tData.posts ..
@@ -1547,6 +1466,17 @@ RegionSync.TestPathChunks = function(_r)
   return bOk and type(tChunks) == "table" and #tChunks or nil
 end
 
+-- Autotest (--warm / --case): forget changes and echo areas an earlier test case left behind.
+RegionSync.ResetTransient = function()
+  s.tAcc = {}
+  s.tIgnore = {}
+  s.bSettled = false
+  s.tAllFlags = {}
+  s.tSeenFlags = {}
+  s.nIgnoreFenceUntil = -1
+  s.nLastPathDy = nil
+end
+
 -- Autotest: last measured path bottom offset (cm) of a remote path apply, then cleared.
 RegionSync.TakeLastPathDy = function()
   local n = s.nLastPathDy
@@ -1582,9 +1512,23 @@ RegionSync.OnPacket = function(_tMsg)
 end
 
 -- ---- detection -------------------------------------------------------------------------------------------
+-- A premade blueprint travels whole (BuildSync k = "bp"): its fences and paths are never sent as regions,
+-- which mirrored an aviary's walls + net without decoration and could remove the host's net on apply.
+local IsPremadeQuiet = function()
+  if not BuildSync.IsPremadeQuiet() then
+    s.bPremadeLogged = false
+    return false
+  end
+  if not s.bPremadeLogged then
+    s.bPremadeLogged = true
+    Log("changes belong to a premade blueprint sent whole, not sent as regions")
+  end
+  return true
+end
+
 local OnSpatialChanged = function(_tMessages)
   if type(_tMessages) ~= "table" or not s.bSending or Bridge.IsApplying() or
-      s.nClock < s.nStartedAt + c_nStartupIgnore then
+      s.nClock < s.nStartedAt + c_nStartupIgnore or IsPremadeQuiet() then
     return
   end
   for _, tMessage in pairs(_tMessages) do
@@ -1615,6 +1559,15 @@ local OnHabitatEvent = function(_tMessages)
     return
   end
   local tWorldAPIs = api.world.GetWorldAPIs()
+  if IsPremadeQuiet() then
+    -- Still learn the new habitats, so they are not picked up later as "newly formed" and sent.
+    pcall(function()
+      for _, nHabEntity in pairs(tWorldAPIs.facilities:GetAllHabitatsEntityIDs() or {}) do
+        s.tKnownHabitats[nHabEntity] = true
+      end
+    end)
+    return
+  end
   local bFoundExplicit = false
   local QueueHab = function(_nHabEntity)
     if type(_nHabEntity) ~= "number" or tWorldAPIs.habitat == nil then

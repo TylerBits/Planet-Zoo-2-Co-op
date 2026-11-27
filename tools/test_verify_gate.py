@@ -143,6 +143,35 @@ def test_stop_hook_active_loop_guard():
         assert not blocked(r, {"stop_hook_active": True, "transcript_path": str(transcript)})
 
 
+def test_other_sessions_edits_do_not_block():
+    with repo() as r:
+        edit(r, "src/ovl_mod/pz2coop.bridge.lua")  # another session's uncommitted work
+        assert vg.write_session_baseline(r, "s-1") == ["src/ovl_mod/pz2coop.bridge.lua"]
+        assert not blocked(r, {"session_id": "s-1"})
+        assert blocked(r, {"session_id": "s-unknown"})  # no baseline for this session: fail closed
+        assert blocked(r)  # no session id (e.g. release check): every dirty file counts
+        edit(r, "src/ovl_mod/pz2coop.bridge.lua")  # this session touches it again
+        assert blocked(r, {"session_id": "s-1"})
+    with repo() as r:
+        edit(r, "src/ovl_mod/pz2coop.bridge.lua")
+        vg.write_session_baseline(r, "s-2")
+        edit(r, "src/proxy_dll/dllmain.cpp")  # new edit by this session
+        assert blocked(r, {"session_id": "s-2"})
+        (r / "src/ovl_mod/pz2coop.bridge.lua").unlink()  # deleting a baselined file is a change too
+        vg.write_session_baseline(r, "s-2")  # compact/resume: baseline is never rewritten
+        assert vg.session_dirty_files(r, "s-2") == ["src/ovl_mod/pz2coop.bridge.lua", "src/proxy_dll/dllmain.cpp"]
+
+
+def test_honest_reply_passes_first_stop():
+    with repo() as r:
+        edit(r, "src/ovl_mod/pz2coop.regionsync.lua")
+        for msg in ("Planning only. Offline only, NOT verified in game.",
+                    "Nothing is fixed: offline only, NOT verified in game.",
+                    'The gate counts the word "fixed" as a claim. NOT verified in game.'):
+            assert not blocked(r, {"last_assistant_message": msg}), msg
+        assert blocked(r, {"last_assistant_message": "Path sync is fixed. NOT verified in game."})
+
+
 def test_live_runner_refuses_stale_or_foreign_runs():
     with repo() as r:
         edit(r, "src/ovl_mod/pz2coop.regionsync.lua")
@@ -187,6 +216,156 @@ def test_fixture_chunk_count():
         except ValueError:
             continue
         raise AssertionError("mismatched fixture accepted")
+
+
+def test_modular_autotest_files_tracked_as_tests():
+    with repo() as r:
+        assert not vg.is_production("src/ovl_mod/pz2coop.at_vehicle_bounds.lua")
+        h0 = vg.compute_test_hash(r)
+        (r / "src/ovl_mod/pz2coop.at_demo.lua").write_text("-- demo\n", encoding="utf-8")
+        h1 = vg.compute_test_hash(r)
+        assert h1 != h0
+        assert vg.dirty_production_files(r) == []
+
+
+def test_failure_packet_signatures_and_slice():
+    lines = [(10, "61187781 LOG  lua: region sync: job failed: entity 123 at 0x7ff00a"),
+             (11, "61187790 LOG  lua: region sync: job failed: entity 456 at 0x7ff00b"),
+             (12, "61187799 LOG  lua: AUTOTEST_CHECK mp_path_own PASS | ok"),
+             (13, "61187800 LOG  lua: AUTOTEST_CHECK mp_path_undo FAIL | undoHits=3"),
+             (14, "61187801 LOG  lua: path query: hits=4"),
+             (15, "61190375 FILE CreateFileW FAIL \\\\?\\C:\\game\\Manifest.xml"),  # file-open trace: noise
+             (16, "61190399 LOG  lua: AUTOTEST_SUMMARY pass=10 fail=1")]
+    sigs = live.failure_signatures(lines)
+    assert sigs[0] == ("lua: region sync: job failed: entity # at 0x#", 2, 10), sigs
+    # the PASS check, the info line, the FILE trace and the summary are not buckets
+    assert len(sigs) == 2 and sigs[1][1:] == (1, 13), sigs
+    many = [(i, f"error kind{chr(65 + i)}") for i in range(20)]
+    assert len(live.failure_signatures(many)) == 12
+    assert live.diag_slice(5, [30, 40], 90) == "DIAG_SLICE: diag.log:L20-L90"
+    assert live.diag_slice(25, [30], 90) == "DIAG_SLICE: diag.log:L25-L90"  # never before this run's first line
+    assert live.diag_slice(25, [], 90) == "DIAG_SLICE: diag.log:L25-L90"
+    assert len(live.signature("x" * 500)) == 110
+
+
+def test_hot_runs_never_stamp():
+    with repo() as r:
+        edit(r, "src/ovl_mod/pz2coop.regionsync.lua")
+        hot = passing_meta(r, "abc") | {"hot": "1"}
+        assert "hot run" in vg.write_stamp(r, "mirror_place", "abc", hot, True)
+        assert not (r / vg.STAMP_REL).exists() and blocked(r)
+        assert vg.write_stamp(r, "mirror_place", "abc", passing_meta(r, "abc"), True) is None  # cold run still stamps
+    coop = pathlib.Path(tempfile.mkdtemp(prefix="pz2coop_trig_"))
+    try:
+        assert live.build_trigger("full", "r1", coop, False) == "full,run.r1"
+        assert live.build_trigger("full", "r1", coop, True, "mp_path_undo", True) == \
+            "full,run.r1,case.mp_path_undo,hot,stopfail"
+    finally:
+        shutil.rmtree(coop, ignore_errors=True)
+
+
+def test_path_fixture_save_backup_restore():
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="pz2coop_fx_"))
+    coop, backup = tmp / "PZ2Coop", tmp / "fixtures"
+    coop.mkdir()
+    try:
+        (coop / "path_3.bin").write_bytes(blueprint(2, 2))
+        newest = coop / "path_9.bin"
+        newest.write_bytes(blueprint(4, 4))
+        import os
+        os.utime(coop / "path_3.bin", (1, 1))  # older
+        msg = live.save_path_fixture(coop, backup)
+        assert "path_9.bin (4 chunks" in msg, msg
+        assert (coop / "test_path.bin").read_bytes() == newest.read_bytes() == (backup / "test_path.bin").read_bytes()
+        (coop / "test_path.bin").unlink()  # e.g. build_ovl_mod.py --uninstall wiped <game>/PZ2Coop
+        (coop / "clip_12.bin").write_bytes(b"aquarium")
+        live.ensure_fixtures("mirror_place", coop, backup)
+        assert live.fixture_chunk_count((coop / "test_path.bin").read_bytes()) == 4  # restored from backup
+        assert (backup / "test_aquarium.bin").read_bytes() == b"aquarium"  # every used fixture gets a backup
+        newest.write_bytes(b"not a blueprint")
+        os.utime(newest, None)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                live.save_path_fixture(coop, backup)
+        except SystemExit as exc:
+            assert "not a usable path blueprint" in str(exc)
+        else:
+            raise AssertionError("broken path blueprint accepted as fixture")
+        assert live.fixture_chunk_count((backup / "test_path.bin").read_bytes()) == 4  # backup untouched
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_agent_status_is_short_and_read_only():
+    import agent_status
+    before = vg.git_changed(ROOT)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        saved, sys.argv = sys.argv, ["agent_status.py"]
+        try:
+            assert agent_status.main() == 0
+        finally:
+            sys.argv = saved
+    out = buf.getvalue().splitlines()
+    assert 3 <= len(out) <= agent_status.MAX_LINES and out[0].startswith("git: "), out
+    assert vg.git_changed(ROOT) == before  # wrote nothing
+    sym = agent_status.symbols(ROOT, "regionsync_logic")
+    assert any("Logic.PlanPathChunks = function(" in s for s in sym), sym
+
+
+def test_hot_logic_guard():
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="pz2coop_hot_"))
+    try:
+        good = tmp / "pz2coop.demo_logic.lua"
+        good.write_text("-- no api.* calls, no undo\nlocal L = {}\nL.F = function(a) return a + 1 end\nreturn L\n",
+                        encoding="utf-8")
+        assert live.check_hot_logic(good) is None
+        assert "pairs(L)" in live.hot_logic_eval(good)
+        for body in ("api.messaging.RegisterReceiver(1, f)", "local U = api.undo", "local B = require('x')",
+                     "coroutine.yield()"):
+            bad = tmp / "pz2coop.bad_logic.lua"
+            bad.write_text("local L = {}\n" + body + "\nreturn L\n", encoding="utf-8")
+            assert live.check_hot_logic(bad) is not None, body
+        big = tmp / "pz2coop.big_logic.lua"
+        big.write_text("local L = {}\n" + "-- pad\n" * 3000 + "return L\n", encoding="utf-8")
+        assert "bytes >" in live.check_hot_logic(big)
+        hooked = tmp / "pz2coop.regionsync.lua"
+        hooked.write_text("return {}\n", encoding="utf-8")
+        assert "only src/ovl_mod/pz2coop.*_logic.lua" in live.check_hot_logic(hooked)
+        real = ROOT / "src" / "ovl_mod" / "pz2coop.regionsync_logic.lua"
+        assert live.check_hot_logic(real) is None, live.check_hot_logic(real)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_offline_stamp_allows_only_when_live_cannot_run():
+    with repo() as r:
+        edit(r, "src/ovl_mod/pz2coop.regionsync.lua")
+        saved = vg.live_blocker
+        try:
+            vg.live_blocker = lambda plans, game_dir=None: "live fixture(s) missing"
+            assert blocked(r)  # no offline stamp yet
+            vg.write_offline_stamp(r)
+            code, msg = vg.gate(r, {})
+            assert code == 0 and "NOT verified in game" in msg, msg
+            edit(r, "src/ovl_mod/pz2coop.regionsync.lua")  # code changed after the offline run
+            assert blocked(r)
+            vg.write_offline_stamp(r)
+            vg.live_blocker = lambda plans, game_dir=None: None  # live plan can run here: only a live PASS counts
+            assert blocked(r)
+        finally:
+            vg.live_blocker = saved
+        game, backup = r / "game", r / "backup"
+        assert "game not installed" not in (vg.live_blocker(["mirror_place"], game, backup) or "")
+        assert "test_path.bin" in vg.live_blocker(["mirror_place"], game, backup)
+        (game / "PZ2Coop").mkdir(parents=True)
+        (game / "PZ2Coop" / "path_6.bin").write_bytes(b"x")  # a stray path_<n>.bin is not the fixture
+        (game / "PZ2Coop" / "test_aquarium.bin").write_bytes(b"x")
+        assert "test_path.bin" in vg.live_blocker(["mirror_place"], game, backup)
+        backup.mkdir()
+        (backup / "test_path.bin").write_bytes(b"x")  # restorable from the build/fixtures backup
+        assert vg.live_blocker(["mirror_place"], game, backup) is None
+        assert vg.guard_stamp(r, {"tool_input": {"file_path": "build/offline_stamp.json"}})[0] == 2
 
 
 def main() -> int:

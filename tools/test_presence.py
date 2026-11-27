@@ -762,15 +762,41 @@ assert(bHeadHiddenSeen, "head rig must hide when the camera enters first person"
 assert(transforms[parent] ~= nil, "own body must stay visible in first person")
 assert(hidden[avatar] ~= true, "own body root must NOT be hidden in first person")
 assert(hidden[nOwnHeadRig] == true, "own head rig must stay hidden in first person")
--- body is offset subtly backward (-0.16 m along facing yaw) in 1P so looking down shows chest/legs cleanly
+-- body is anchored from live def_c_neck1_joint so the animated neck collar stays strictly behind the 1P eye
 local fpPose = __PZ2CoopPresenceState.tOwnPose
 assert(fpPose ~= nil and fpPose.bFirstPerson == true and fpPose.bHeadHidden == true, "1P pose metadata must be set")
 local nFpYaw = __PZ2CoopPresenceState.nBodyYaw
-local nExpBackX = fpPose.x - math.sin(nFpYaw) * 0.16
-local nExpBackZ = fpPose.z - math.cos(nFpYaw) * 0.16
-assert(math.abs(transforms[parent].pos:GetX() - nExpBackX) < 0.02 and
-       math.abs(transforms[parent].pos:GetZ() - nExpBackZ) < 0.02,
-  "1P body must sit 0.16 m behind eye so looking down shows chest/legs instead of hollow neck")
+local nExpBackX = fpPose.x - math.sin(nFpYaw) * 0.22
+local nExpBackZ = fpPose.z - math.cos(nFpYaw) * 0.22
+assert(math.abs(transforms[parent].pos:GetX() - nExpBackX) < 0.03 and
+       math.abs(transforms[parent].pos:GetZ() - nExpBackZ) < 0.03,
+  "1P body must place animated neck 0.14 m behind eye (root -0.22 m at idle fallback nz=0.08)")
+assert(math.abs(transforms[parent].pitch or 0) < 1e-6, "1P procedural forward pitch must be 0")
+-- Simulate sprinting forward torso lean (def_c_neck1_joint at local nz = +0.34 m) + looking straight down (+1.2 rad):
+-- world neck position must STILL remain strictly behind the camera eye (zero collar/back clipping!)
+do
+  local origGetNeck = require("PZ2Coop.Avatar").GetLocalNeckPivot
+  require("PZ2Coop.Avatar").GetLocalNeckPivot = function() return 0.0, 1.30, 0.34, true end
+  walkingData.tFinal.vCameraYPR = vec(0, 0, 0)
+  WalkingCamera.Advance(walkingData, tWorldAPIs, 0.05)
+  pump(1)
+  local nSprintRootZ = transforms[parent].pos:GetZ()
+  local nWorldNeckZ = nSprintRootZ + 0.34
+  assert(nWorldNeckZ <= walkingData.tFinal.vCameraPos:GetZ() - 0.13,
+    "sprinting RunBase lean (nz=0.34) must keep world neck >= 0.14 m behind eye, got dz=" ..
+    tostring(walkingData.tFinal.vCameraPos:GetZ() - nWorldNeckZ))
+  -- Looking straight down (+1.2 rad) adds pitch clearance (~0.08 m) so sightline stays cleanly in front of collar
+  walkingData.tFinal.vCameraYPR = vec(0, 1.2, 0)
+  WalkingCamera.Advance(walkingData, tWorldAPIs, 0.05)
+  pump(1)
+  local nLookDownNeckZ = transforms[parent].pos:GetZ() + 0.34
+  assert(nLookDownNeckZ <= walkingData.tFinal.vCameraPos:GetZ() - 0.21,
+    "looking down (+1.2 rad) must add pitch clearance (>= 0.21 m behind eye), got dz=" ..
+    tostring(walkingData.tFinal.vCameraPos:GetZ() - nLookDownNeckZ))
+  require("PZ2Coop.Avatar").GetLocalNeckPivot = origGetNeck
+  walkingData.tFinal.vCameraYPR = vec(0, 0, 0)
+  __PZ2CoopPresenceState.tFpNeckLocal = nil
+end
 -- standing in 1P and turning 180 deg pivots body smoothly to follow camera yaw (never staring at own back)
 walkingData.tFinal.vCameraYPR = vec(math.pi, 0, 0)
 for _ = 1, 30 do
@@ -780,31 +806,32 @@ end
 local nDiffAfterTurn = math.abs(((__PZ2CoopPresenceState.nBodyYaw - math.pi + math.pi) % (2 * math.pi)) - math.pi)
 assert(nDiffAfterTurn <= math.rad(36), "1P body yaw must pivot to follow large camera turns, diff=" .. tostring(math.deg(nDiffAfterTurn)))
 walkingData.tFinal.vCameraYPR = vec(0, 0, 0)
--- 1P LegsRig upper/lower-body split & reverse playback for strafing and backpedaling
-local nOwnLegsRig = ownBody.tAnim.nLegsRig
-assert(nOwnLegsRig ~= nil, "own animated avatar must have a dedicated LegsRig")
+-- 1P unified whole-body directional turn & reverse playback for strafing and backpedaling (zero waist seam split)
+assert(ownBody.tAnim.nLegsRig == nil, "Legs must stay unified under avatar root with zero waist split")
 local AvatarMod2 = require("PZ2Coop.Avatar")
-local lyFwd, revFwd = AvatarMod2.ComputeLegsTwistTarget(0, 2.0, true)
-assert(math.abs(lyFwd) < 1e-5 and revFwd == false, "forward move must have 0 twist and forward playback")
-local lyDiag, revDiag = AvatarMod2.ComputeLegsTwistTarget(math.rad(45), 2.0, true)
-assert(math.abs(lyDiag - math.rad(45)) < 1e-5 and revDiag == false, "diagonal forward-right must twist +45 deg")
-local lyStrafeR, revStrafeR = AvatarMod2.ComputeLegsTwistTarget(math.rad(90), 2.0, true)
-assert(math.abs(lyStrafeR - math.rad(62)) < 1e-5 and revStrafeR == false, "pure right strafe must clamp at +62 deg")
-local lyBack, revBack = AvatarMod2.ComputeLegsTwistTarget(math.pi, 2.0, true)
-assert(math.abs(lyBack) < 1e-5 and revBack == true, "straight backpedal must have 0 twist and reverse playback")
-local lyBackR, revBackR = AvatarMod2.ComputeLegsTwistTarget(math.rad(135), 2.0, true)
-assert(math.abs(lyBackR - math.rad(-45)) < 1e-5 and revBackR == true, "back-right diagonal must twist -45 deg with reverse playback")
--- Live 1P strafe right (+X while facing +Z): LegsRig twists right (> +45 deg), playback stays positive
+local lyFwd, revFwd = AvatarMod2.ComputeFirstPersonStrafeGoal(0, 2.0, true)
+assert(math.abs(lyFwd) < 1e-5 and revFwd == false, "forward move must have 0 body angle and forward playback")
+local lyDiag, revDiag = AvatarMod2.ComputeFirstPersonStrafeGoal(math.rad(45), 2.0, true)
+assert(math.abs(lyDiag - math.rad(45)) < 1e-5 and revDiag == false, "diagonal forward-right must angle +45 deg")
+local lyStrafeR, revStrafeR = AvatarMod2.ComputeFirstPersonStrafeGoal(math.rad(90), 2.0, true)
+assert(math.abs(lyStrafeR - math.rad(52)) < 1e-5 and revStrafeR == false, "pure right strafe must clamp at +52 deg")
+local lyBack, revBack = AvatarMod2.ComputeFirstPersonStrafeGoal(math.pi, 2.0, true)
+assert(math.abs(lyBack) < 1e-5 and revBack == true, "straight backpedal must have 0 angle and reverse playback")
+local lyBackR, revBackR = AvatarMod2.ComputeFirstPersonStrafeGoal(math.rad(135), 2.0, true)
+assert(math.abs(lyBackR - math.rad(-35)) < 1e-5 and revBackR == true, "back-right diagonal must angle -35 deg with reverse playback")
+-- Live 1P strafe right (+X while facing +Z): unified whole body turns smoothly (+40..52 deg) & pulls back along camYaw
 local baseX, baseZ = 61.4, 6.2
 for i = 1, 20 do
   walkingData.tFinal.vCameraPos = vec(baseX + i * 0.12, 11.55, baseZ)
   WalkingCamera.Advance(walkingData, tWorldAPIs, 0.05)
   pump(1)
 end
-assert(transforms[nOwnLegsRig] and transforms[nOwnLegsRig].yaw > math.rad(45),
-  "1P right strafe must twist LegsRig > +45 deg, got " .. tostring(transforms[nOwnLegsRig] and math.deg(transforms[nOwnLegsRig].yaw)))
+assert(__PZ2CoopPresenceState.nBodyYaw > math.rad(45) and __PZ2CoopPresenceState.nBodyYaw <= math.rad(53),
+  "1P right strafe must turn unified whole body ~+52 deg, got " .. tostring(math.deg(__PZ2CoopPresenceState.nBodyYaw)))
+assert(transforms[parent].pos:GetZ() < baseZ - 0.18,
+  "1P angled strafe must pull body back along camYaw with shoulder clearance, got dz=" .. tostring(transforms[parent].pos:GetZ() - baseZ))
 assert(ownBody.tAnim.nRate > 0, "1P right strafe must use positive playback rate, got " .. tostring(ownBody.tAnim.nRate))
--- Live 1P walk backward (-Z while facing +Z): LegsRig relaxes near 0, playback rate goes negative (reverse stride!)
+-- Live 1P walk backward (-Z while facing +Z): unified whole body aligns near 0, playback rate goes negative (reverse WalkBase!)
 local strX = baseX + 20 * 0.12
 for i = 1, 20 do
   walkingData.tFinal.vCameraPos = vec(strX, 11.55, baseZ - i * 0.12)
@@ -813,14 +840,23 @@ for i = 1, 20 do
 end
 assert(ownBody.tAnim.nRate < 0, "1P backpedal must play walk/run in reverse (negative rate), got " .. tostring(ownBody.tAnim.nRate))
 assert(ownBody.tAnim.sState == "walk", "1P backpedal must stay capped to WalkBase, got " .. tostring(ownBody.tAnim.sState))
-assert(math.abs(ownBody.tAnim.nLegsYaw) < math.rad(10),
-  "1P straight backpedal must keep LegsRig aligned near 0, got " .. tostring(math.deg(ownBody.tAnim.nLegsYaw)))
+assert(math.abs(__PZ2CoopPresenceState.nBodyYaw) < math.rad(10),
+  "1P straight backpedal must keep unified body aligned near 0, got " .. tostring(math.deg(__PZ2CoopPresenceState.nBodyYaw)))
 -- Even at sprint speed (5.5 m/s), reverse playback must stay capped to WalkBase (never JogBase or RunBase)
 for i = 1, 15 do
   AvatarMod2.UpdateAnimation(ownBody.tAnim, ownBody.nAvatar, 5.5, 0.05, false, "clear", false, true)
 end
 assert(ownBody.tAnim.sState == "walk" and ownBody.tAnim.nRate < 0,
   "high-speed backpedal must stay capped to walk with negative rate, got " .. tostring(ownBody.tAnim.sState) .. " / " .. tostring(ownBody.tAnim.nRate))
+-- Turn-in-place footwork: pivoting in place (speed=0, |turnRate|>=1.2) steps immediately on frame 1 in WalkBase (~0.58x), then settles back to idle
+AvatarMod2.ResetAnimSpeed(ownBody.tAnim, ownBody.nAvatar)
+AvatarMod2.UpdateAnimation(ownBody.tAnim, ownBody.nAvatar, 0, 0.05, false, "clear", false, false, 2.5)
+assert(ownBody.tAnim.sState == "walk" and ownBody.tAnim.nRate > 0 and ownBody.tAnim.nRate <= 0.65,
+  "turn-in-place must step immediately on frame 1 in WalkBase (~0.58x), got " .. tostring(ownBody.tAnim.sState) .. " / " .. tostring(ownBody.tAnim.nRate))
+for _ = 1, 10 do
+  AvatarMod2.UpdateAnimation(ownBody.tAnim, ownBody.nAvatar, 0, 0.05, false, "clear", false, false, 0)
+end
+assert(ownBody.tAnim.sState == "idle", "turn-in-place must settle back to idle when rotation stops, got " .. tostring(ownBody.tAnim.sState))
 -- 1P sprint suppression: Shift+S and Shift+D suppress GameCamera_SpeedMod, while Shift+W and Shift+W+D keep it
 do
   local origGetKeyDown = tWorldAPIs.InputManager.GetKeyDown

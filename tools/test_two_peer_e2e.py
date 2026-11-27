@@ -30,6 +30,7 @@ MODULE_FILES = {
     "PZ2Coop.Bridge": "pz2coop.bridge.lua",
     "PZ2Coop.BuildSync": "pz2coop.buildsync.lua",
     "PZ2Coop.RegionSync": "pz2coop.regionsync.lua",
+    "PZ2Coop.RegionSync_Logic": "pz2coop.regionsync_logic.lua",
     "PZ2Coop.WaterSync": "pz2coop.watersync.lua",
     "PZ2Coop.TerrainSync": "pz2coop.terrainsync.lua",
     "PZ2Coop.StaffSync": "pz2coop.staffsync.lua",
@@ -96,6 +97,9 @@ state = {
   avatarGroup = PEER_GROUP,
   lakes = {},
   staff = {},
+  exhibits = {[50] = {pos = vec(40, 0, 50), animals = {}}},
+  researchTiers = {Vet_Lion = 0},
+  researchMaxTier = {Vet_Lion = 5},
   nextId = 100,
   transforms = {},
   hidden = {},
@@ -114,10 +118,30 @@ local tWorldAPIs = {
   },
   park = {ExpenditureCategory_Rewards = 1, GetTimeOfDay = function() return state.todHour, state.todMinute end},
   wildterritory = {IsWildTerritoryCreationEnabled = function() return state.isWildArea == true end},
-  exhibits = {AddAnimalToExhibit = function(_, exId, sp, bMale) call("AddAnimalToExhibit", exId, sp, bMale) end},
+  exhibits = {
+    AddAnimalToExhibit = function(_, exId, sp, bMale)
+      call("AddAnimalToExhibit", exId, sp, bMale)
+      if state.exhibits[exId] then
+        table.insert(state.exhibits[exId].animals, {species = sp, male = bMale})
+      end
+    end,
+    IsAnimalMale = function() return true end,
+  },
+  research = {
+    GetPinnedResearch = function() return "Vet_Lion" end,
+    GetCurrentTier = function(_, topic) return state.researchTiers[topic] or 0 end,
+    IsResearchTopic = function(_, topic) return state.researchMaxTier[topic] ~= nil end,
+    GetMaxTier = function(_, topic) return state.researchMaxTier[topic] or 0 end,
+    SetTierForTopic = function(_, topic, tier)
+      state.researchTiers[topic] = tier
+      call("SetTierForTopic", topic, tier)
+    end,
+    ClearNotificationBlip = function(_, topic) call("ClearNotificationBlip", topic) end,
+  },
   ModeHelperComponent = {GetCurrentModeName = function() return "WalkingCamera" end},
   InputManager = {GetKeyPressed = function() return false end, GetMouseInput = function() return {RawZAxis = 0} end},
   motiongraph = {SetVariable = function() end},
+  bakedanimation = {RequestAllBonesForCalculate = function() end},
   model = {SetHidden = function(_, id, b) state.hidden[id] = b end},
   voxelterrain = {SphereSweep = function() return nil end},
   CameraModeManager = {
@@ -136,13 +160,33 @@ local tWorldAPIs = {
     end,
     CalculateWorldTransform = function(_, id)
       local st = state.staff[id]
-      if st then return {GetPos = function() return st.pos end} end
+      if st then return {GetPos = function() return st.pos end, Pos = function() return st.pos end} end
+      local ex = state.exhibits[id]
+      if ex then return {GetPos = function() return ex.pos end, Pos = function() return ex.pos end} end
       return nil
     end,
     GetParent = function() return nil end,
   },
   billboardwidgets = {WidgetType_WidgetLabel = 7},
-  spatial = {Flag_Path = 1, Flag_HabitatBoundary = 524288, CylinderQuery = function() return {} end},
+  spatial = {
+    Flag_Path = 1,
+    Flag_Exhibit = 2,
+    Flag_HabitatBoundary = 524288,
+    CylinderQuery = function() return {} end,
+    SphereQuery = function(_, vPos, r, nFlag)
+      if nFlag == 2 then
+        local hits = {}
+        for id, ex in pairs(state.exhibits) do
+          local dx = ex.pos:GetX() - vPos:GetX()
+          local dy = ex.pos:GetY() - vPos:GetY()
+          local dz = ex.pos:GetZ() - vPos:GetZ()
+          if dx*dx + dy*dy + dz*dz <= r*r then table.insert(hits, id) end
+        end
+        return hits
+      end
+      return {}
+    end,
+  },
   gameterrain = {
     GetAllLakes = function()
       local t = {}
@@ -267,6 +311,13 @@ api = {
         ResumeAutosave = function() state.autosaveSuspended = false end,
       }
     end,
+  },
+  api_anim = nil,
+  animationcontrol = {
+    SetBaseAnimation = function(id, clip) call("SetBaseAnimation", id, clip) end,
+    SetPlaybackRate = function() end,
+    QueueOneShotAnimation = function(id, clip) call("QueueOneShot", id, clip) end,
+    ClearOneShotQueueAndForceStopOneShot = function() end,
   },
   json = {
     Stringify = function(t) return true, PY_JSON_DUMPS(t) end,
@@ -400,7 +451,9 @@ function deliverEvent(tEvent)
     s.bPeerConnected = false
     Bridge.GetSession().sPartner = nil
   end
-  s.fnHandler({sKind = "event", tData = tEvent})
+  if s.fnHandler ~= nil then
+    s.fnHandler({sKind = "event", tData = tEvent})
+  end
 end
 
 function deliverPacket(nType, sFile, sJson)
@@ -412,8 +465,16 @@ function deliverPacket(nType, sFile, sJson)
     if type(tData.scenario) == "string" and #tData.scenario > 0 then s.sHostScenario = tData.scenario end
     if type(tData.diff) == "string" then s.sHostDifficulty = tData.diff end
     if tData.wild ~= nil then s.bHostWildArea = tData.wild == true end
+    local localVer = Bridge.GetModVersion and Bridge.GetModVersion() or nil
+    if type(tData.ver) == "string" and tData.ver ~= "" and localVer ~= nil and tData.ver ~= localVer then
+      s.sVersionMismatch = "peer " .. string.sub(tData.ver, 1, 16) .. " vs local " .. localVer
+    else
+      s.sVersionMismatch = nil
+    end
   end
-  __PZ2CoopBridgeState.fnHandler({sKind = "packet", nType = nType, sFile = sFile, tData = tData})
+  if __PZ2CoopBridgeState.fnHandler ~= nil then
+    __PZ2CoopBridgeState.fnHandler({sKind = "packet", nType = nType, sFile = sFile, tData = tData})
+  end
 end
 
 function tick(n)
@@ -450,6 +511,27 @@ function triggerLocalStaffFire(id)
   for _, fn in ipairs(receivers.MsgType_StaffCreatedOrDestroyedMessage or {}) do
     fn({{staffEntityID = id, bCreated = false}})
   end
+end
+
+function triggerLocalResearchUnlock(sTopic, nTier)
+  state.researchTiers[sTopic] = nTier
+  for _, fn in ipairs(receivers.MsgType_ResearchUpdatedMessage or {}) do
+    fn({{sTopic = sTopic, bOnLoad = false}})
+  end
+end
+
+function triggerLocalExhibitAdd(nExhibitID, sSpecies)
+  state.nextId = state.nextId + 1
+  local id = state.nextId
+  for _, fn in ipairs(receivers.MsgType_ExhibitAnimalAddedMessage or {}) do
+    fn({{nAnimalID = id, nParentExhibitEntityID = nExhibitID, sSpecies = sSpecies}})
+  end
+  return id
+end
+
+function triggerLocalEmote(sId)
+  local Actions = require("PZ2Coop.Actions")
+  return Actions.PlayEmote(sId)
 end
 
 function drainOutbox()
@@ -590,24 +672,102 @@ def main() -> int:
     assert guest.globals().staffCount() == 0, f"guest staff not fired: {guest.globals().staffCount()}"
     assert not any(t == 0x30 and d.get("k") == "staff" for t, _, d in sent_g), "guest echoed staff fire"
 
+    # 3b. Research tier unlock (0x30 k="research") Host -> Guest + zero echo + invalid topic rejected
+    host.globals().triggerLocalResearchUnlock("Vet_Lion", 2)
+    sent_h, sent_g = pump_wire(host, guest, rounds=15)
+    assert any(t == 0x30 and d.get("k") == "research" and d.get("topic") == "Vet_Lion" and d.get("tier") == 2 for t, _, d in sent_h), (
+        f"research unlock not sent: {sent_h}"
+    )
+    assert guest.globals().state["researchTiers"]["Vet_Lion"] == 2, (
+        f"guest research tier not synced: {guest.globals().state['researchTiers']['Vet_Lion']}"
+    )
+    assert not any(t == 0x30 and d.get("k") == "research" for t, _, d in sent_g), f"guest echoed research unlock: {sent_g}"
+    guest.globals().deliverPacket(0x30, None, json.dumps({"k": "research", "topic": "../../evil", "tier": 5}))
+    pump_wire(host, guest, rounds=5)
+    assert guest.globals().state["researchTiers"]["../../evil"] is None, "malicious research topic was applied!"
+
+    # 3c. Exhibit animal add (0x30 k="exhibit") Host -> Guest + zero echo + invalid species rejected
+    host.globals().triggerLocalExhibitAdd(50, "BoaConstrictor")
+    sent_h, sent_g = pump_wire(host, guest, rounds=15)
+    assert any(t == 0x30 and d.get("k") == "exhibit" and d.get("op") == "add" and d.get("s") == "BoaConstrictor" for t, _, d in sent_h), (
+        f"exhibit animal add not sent: {sent_h}"
+    )
+    g_ex_animals = lua_to_py(guest.globals().state["exhibits"][50]["animals"])
+    assert any(a["species"] == "BoaConstrictor" for a in g_ex_animals), f"guest exhibit animal not added: {g_ex_animals}"
+    assert not any(t == 0x30 and d.get("k") == "exhibit" for t, _, d in sent_g), f"guest echoed exhibit add: {sent_g}"
+    guest.globals().deliverPacket(0x30, None, json.dumps({"k": "exhibit", "op": "add", "s": "../bad", "x": 4000, "y": 0, "z": 5000}))
+    pump_wire(host, guest, rounds=5)
+    assert len(lua_to_py(guest.globals().state["exhibits"][50]["animals"])) == 1, "malicious exhibit species was added!"
+
+    # 3d. Emote & Held Prop (0x12 k="action") Host -> Guest + zero echo + trust boundary rejects unknown IDs
+    guest.execute('local P = require("PZ2Coop.Presence"); local b = P.GetFriendBody(); if b and b.tAnim then b.tAnim.bAnimated = true end')
+    assert host.globals().triggerLocalEmote("cheer") is True, "host failed to play cheer emote"
+    assert host.globals().triggerLocalEmote("prop_umbrella") is True, "host failed to equip umbrella prop"
+    sent_h, sent_g = pump_wire(host, guest, rounds=10)
+    assert any(t == 0x12 and d.get("k") == "action" and d.get("op") == "emote" and d.get("id") == "cheer" for t, _, d in sent_h), (
+        f"emote packet not sent: {sent_h}"
+    )
+    assert any(t == 0x12 and d.get("k") == "action" and d.get("op") == "prop" and d.get("id") == "prop_umbrella" for t, _, d in sent_h), (
+        f"prop packet not sent: {sent_h}"
+    )
+    assert not any(t == 0x12 and d.get("k") == "action" for t, _, d in sent_g), f"guest echoed action packet: {sent_g}"
+    g_calls_act = lua_to_py(guest.globals().calls)
+    assert any(c["name"] == "QueueOneShot" and str(c["args"][1]).endswith("$StandReactCheer") for c in g_calls_act), (
+        f"guest did not play remote cheer animation: {g_calls_act}"
+    )
+    assert any(
+        c["name"] == "InstantiatePrefab" and isinstance(c["args"][0], dict)
+        and c["args"][0].get("Children", {}).get("Prop", {}).get("Prefab") == "umbrella_blue"
+        for c in g_calls_act
+    ), f"guest did not spawn remote umbrella prop: {g_calls_act}"
+    before_spawns = sum(1 for c in g_calls_act if c["name"] == "InstantiatePrefab")
+    guest.globals().deliverPacket(0x12, None, json.dumps({"k": "action", "op": "prop", "id": "Peep_Avatar"}))
+    pump_wire(host, guest, rounds=5)
+    after_spawns = sum(1 for c in lua_to_py(guest.globals().calls) if c["name"] == "InstantiatePrefab")
+    assert after_spawns == before_spawns, "malicious prop ID spawned a prefab!"
+
+    # 3e. Mod-version mismatch warning (0x01 HANDSHAKE_HELLO) -> Red notification once (deduped)
+    guest.globals().deliverPacket(0x01, None, json.dumps({"mode": "Sandbox", "ver": "9.9.9-bad"}))
+    guest.globals().deliverPacket(0x01, None, json.dumps({"mode": "Sandbox", "ver": "9.9.9-bad"}))
+    g_pop_mm = [p for p in lua_to_py(guest.globals().popouts) if "Mod version mismatch" in p["tEntry"]["sNotificationString"]]
+    assert len(g_pop_mm) == 1 and g_pop_mm[0]["sColour"] == "Red", f"version mismatch warning missing or duplicated: {g_pop_mm}"
+
     # 4. Trust boundary: malicious packets from compromised guest are dropped by host
     host.globals().deliverPacket(0x12, None, json.dumps({"group": "TM", "items": {"Hats": {"prefab": "../../evil"}}}))
     host.globals().deliverPacket(0x30, None, json.dumps({"k": "staff", "op": "hire", "t": "Peep_Avatar", "x": 0, "y": 0, "z": 0}))
     pump_wire(host, guest, rounds=5)
     assert host.globals().staffCount() == 0, "malicious staff prefab was spawned!"
 
-    # 5. Disconnect notification preserves partner name
+    # 5. Disconnect notification preserves partner name + clean reconnect re-handshakes & syncs cash
     host.globals().deliverEvent(py_to_lua(host, {"event": "peer_disconnected"}))
+    guest.globals().deliverEvent(py_to_lua(guest, {"event": "peer_disconnected"}))
     h_pop2 = lua_to_py(host.globals().popouts)
     assert any("GuestPlayer left the co-op session" in p["tEntry"]["sNotificationString"] and p["sColour"] == "Red" for p in h_pop2), (
         f"host disconnect notify missing: {h_pop2}"
     )
+    host.globals().state["cash"] = 54321.0
+    host.globals().deliverEvent(py_to_lua(host, {"event": "status", "role": "host", "connected": True, "partner_name": "GuestPlayer", "partner_id": "222"}))
+    guest.globals().deliverEvent(py_to_lua(guest, {"event": "status", "role": "client", "connected": True, "partner_name": "HostPlayer", "partner_id": "111"}))
+    host.globals().deliverEvent(py_to_lua(host, {"event": "peer_connected"}))
+    guest.globals().deliverEvent(py_to_lua(guest, {"event": "peer_connected"}))
+    sent_h_re, _ = pump_wire(host, guest, rounds=15)
+    assert any(t == 0x01 for t, _, _ in sent_h_re), "reconnect did not send fresh 0x01 handshake"
+    assert any(t == 0x02 for t, _, _ in sent_h_re), "reconnect did not send fresh 0x02 baseline"
+    assert abs(guest.globals().state["cash"] - 54321.0) < 0.05, f"cash not synced after reconnect: {guest.globals().state['cash']}"
 
-    # 6. Franchise lockout (CLAUDE.md rule 6): park manager stays disabled and sends zero packets even in a lobby
+    # 6. Franchise lockout (CLAUDE.md rule 6): park manager stays disabled even when already in a lobby
     franchise = make_peer("host", "TM", mode="Franchise")
     assert franchise.globals().Bridge.IsSyncedPark() is False, "Franchise park must not be synced"
+    franchise.globals().deliverEvent(py_to_lua(franchise, {"event": "status", "role": "client", "connected": True, "partner_name": "Host", "partner_id": "111"}))
+    franchise.globals().deliverEvent(py_to_lua(franchise, {"event": "peer_connected"}))
+    franchise.globals().deliverPacket(0x11, None, json.dumps({"cash": 999999.0, "cc": 9999}))
+    franchise.globals().deliverPacket(0x22, None, json.dumps({"k": "water", "op": "add", "x": 100, "y": 100, "z": 100}))
+    franchise.globals().deliverPacket(0x30, None, json.dumps({"k": "staff", "op": "hire", "t": "Keeper", "x": 100, "y": 0, "z": 100}))
     franchise.globals().tick(20)
     assert len(list(franchise.globals().drainOutbox().values())) == 0, "Franchise park sent packets!"
+    assert abs(franchise.globals().state["cash"] - 5000.0) < 0.01, "Franchise park cash was modified by remote packet!"
+    assert franchise.globals().lakeCount() == 0, "Franchise park lake was created by remote packet!"
+    assert franchise.globals().staffCount() == 0, "Franchise park staff was hired by remote packet!"
 
     # 7. ScenarioCareer & ScenarioChallenge co-op + guest autosave suppression + DLC block respect
     sc_host = make_peer("host", "TM", mode="ScenarioCareer", scenario="Scenario_01", diff="Hard", wild=True)
@@ -648,7 +808,7 @@ def main() -> int:
         f"guest return to start screen must suppress save: {sc_g_calls}"
     )
 
-    print("ok: two-peer E2E (handshake, scenarios, saveguard, host-exit kick, speed+ToD, resync, avatars 0x12, water 0x22, staff 0x30, notifications, Franchise lockout)")
+    print("ok: two-peer E2E (handshake+ver-mismatch, reconnect, scenarios, saveguard, host-exit kick, speed+ToD, resync, avatars+emotes+props 0x12, water 0x22, staff+research+exhibit 0x30, notifications, Franchise lockout)")
     return 0
 
 

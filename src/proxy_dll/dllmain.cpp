@@ -11,6 +11,7 @@
 #include "ipc_bridge.hpp"
 #include "steam_p2p.hpp"
 #include "ui_overlay.hpp"
+#include "vehicle_patch.hpp"
 
 namespace {
 
@@ -153,6 +154,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID /*reserved*/) {
             GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
                                reinterpret_cast<LPCWSTR>(&DllMain), &self);
             pz2::installDiagnostics(); // import-table patch only; no loading or locking here
+            pz2::installAutotestInputHook(); // passthrough XInputGetState hook for headless vehicle autotests
             // Threads only start running after the loader lock is released.
             pz2::startDiagnosticScan();
             pz2::startUiOverlayBuild(); // patched game UI built from the player's own files

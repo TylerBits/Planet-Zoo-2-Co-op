@@ -126,6 +126,7 @@ public:
             mem_.poll(files_, deliverFn, now);
             files_.poll(deliverFn, now);
             pollAutotest(now);
+            pollExploreHotkey();
             pumpMessages();
             forwardIncoming();
         }
@@ -253,6 +254,28 @@ private:
         }
     }
 
+    // Explore hotkey: the physical key left of 1 (` / ~ on US layouts, scan code 0x29). Vanilla binds no action
+    // to it (extracted/keybinds_report.txt) and Lua cannot read raw keys, so this thread only reports the press;
+    // Lua decides on its own frame whether entering Explore is allowed (pz2coop.presence.lua).
+    void pollExploreHotkey() {
+        const HWND fg = GetForegroundWindow();
+        DWORD pid = 0;
+        const DWORD fgThread = fg != nullptr ? GetWindowThreadProcessId(fg, &pid) : 0;
+        bool down = false;
+        if (pid == GetCurrentProcessId()) {
+            const UINT vk = MapVirtualKeyExW(0x29, MAPVK_VSC_TO_VK, GetKeyboardLayout(fgThread));
+            down = vk != 0 && (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
+        }
+        if (down && !exploreKeyDown_ && files_.alive()) {
+            NetMessage msg;
+            msg.kind = MsgKind::Json;
+            const std::string_view line = R"({"event":"hotkey_explore"})";
+            msg.data.assign(line.begin(), line.end());
+            files_.forward(msg);
+        }
+        exploreKeyDown_ = down;
+    }
+
     // Dev-only autonomous live-game test trigger (tools/test_live_game.py): if <game>\PZ2Coop\autotest.txt
     // exists once Lua is alive, read its plan name, delete the file immediately, and deliver an autotest event.
     void pollAutotest(Clock::time_point now) {
@@ -288,10 +311,36 @@ private:
         if (plan.empty()) {
             plan = "full";
         }
-        diagLog("autotest: triggering plan '" + plan + "'");
+        // Optional dev-only Lua probe payload (<game>\PZ2Coop\autotest_eval.lua, max 16 KB, deleted immediately).
+        std::string evalHex;
+        const auto evalPath = gameDir() / kFileBridgeDirName / L"autotest_eval.lua";
+        if (std::filesystem::is_regular_file(evalPath, ec)) {
+            std::string code;
+            {
+                std::ifstream ein(evalPath, std::ios::binary);
+                if (ein) {
+                    code.resize(16384);
+                    ein.read(code.data(), static_cast<std::streamsize>(code.size()));
+                    code.resize(static_cast<std::size_t>(ein.gcount()));
+                }
+            }
+            std::filesystem::remove(evalPath, ec);
+            static constexpr char kHex[] = "0123456789abcdef";
+            evalHex.reserve(code.size() * 2);
+            for (const unsigned char b : code) {
+                evalHex.push_back(kHex[b >> 4]);
+                evalHex.push_back(kHex[b & 0x0F]);
+            }
+        }
+        diagLog("autotest: triggering plan '" + plan + "'" +
+                (evalHex.empty() ? "" : (" (eval " + std::to_string(evalHex.size() / 2) + "B)")));
         NetMessage msg;
         msg.kind = MsgKind::Json;
-        const std::string line = std::string(R"({"event":"autotest","plan":")") + plan + "\"}";
+        std::string line = std::string(R"({"event":"autotest","plan":")") + plan + "\"";
+        if (!evalHex.empty()) {
+            line += R"(,"code_hex":")" + evalHex + "\"";
+        }
+        line += "}";
         msg.data.assign(line.begin(), line.end());
         files_.forward(msg);
     }
@@ -642,6 +691,7 @@ private:
     HWND clipWindow_ = nullptr;
     std::string roomCode_;
     Clock::time_point nextAutotest_ = Clock::now();
+    bool exploreKeyDown_ = false;
 };
 
 } // namespace

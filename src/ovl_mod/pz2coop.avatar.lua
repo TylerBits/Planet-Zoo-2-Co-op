@@ -99,11 +99,12 @@ local c_nCollarTuckPitch = 0.065            -- -Y collar tuck per sin(|pitch|) s
 local c_nCollarTuckYaw = 0.030              -- -Y collar tuck per (1 - cos(yaw)) for sloped neckline seam
 local c_tFallbackNeckPivot = {0.0, 1.37, 0.08}
 
--- Upper/lower-body split for 1P strafing & backpedaling: twists Legs RenderGroup independently of Torso.
-local c_nLegsTwistMax = math.rad(62)        -- max lower-body yaw twist relative to torso while strafing
-local c_nLegsBackThreshold = math.rad(105)  -- beyond +/-105 deg from facing, treat as backpedaling (reverse stride)
-local c_nLegsSpringOmega = 14.0             -- responsive critically damped spring for leg twist
-local c_nLegsNeutralEps = 0.002
+-- First-person unified whole-body directional turn & reverse-stride parameters.
+local c_nFpStrafeTurnMax = math.rad(52)     -- max whole-body yaw angle on pure sideways strafe (A/D)
+local c_nFpBackDiagTurnMax = math.rad(35)   -- max whole-body yaw angle on back-diagonals (S+A/S+D)
+local c_nFpBackThreshold = math.rad(105)    -- beyond +/-105 deg from camera facing, play reverse WalkBase
+local c_nTurnStepMinRate = 1.2              -- rad/s standing pivot threshold before feet take gentle turn-in-place steps
+local c_nTurnStepVirtualSpeed = 1.15        -- m/s virtual speed -> gentle ~0.58x WalkBase step while pivoting in place
 local c_bAllowReversePlayback = true        -- negative SetPlaybackRate on BakedAnimation for backwards stepping
 
 -- Suffixes in Guests.ovl (baked .bani clips: AF, AM, TF, TM all ship these exact names).
@@ -244,11 +245,6 @@ Avatar.CreateAnimState = function(_sGroup, _bAnimated, _tMeta, _sInitialClipSuff
     nHeadRig = tMeta and tMeta.nHeadRig or nil,
     tHeadParts = tMeta and tMeta.tHeadParts or nil,
     nNeckAttach = tMeta and tMeta.nNeckAttach or nil,
-    -- Lower-body LegsRig RenderGroup & twist spring (1P strafing / diagonal / backpedal upper-lower split)
-    nLegsRig = tMeta and tMeta.nLegsRig or nil,
-    nLegsYaw = 0,
-    nLegsYawVel = 0,
-    bLegsNeutral = true,
     -- Attached hand-bone prop
     tProp = nil, -- {nAttachId, nPropId, sPrefab, sBone}
   }
@@ -579,10 +575,6 @@ Avatar.SetHidden = function(_tAnim, _nAvatarID, _bHidden)
       end
     end
   end
-  if _tAnim ~= nil and _tAnim.nLegsRig ~= nil and (_tAnim.bLegsRigHidden == true) ~= bHideRoot then
-    _tAnim.bLegsRigHidden = bHideRoot
-    pcall(model.SetHidden, model, _tAnim.nLegsRig, bHideRoot)
-  end
 end
 
 -- Hides/shows ONLY the head-group RenderGroup (Head, Hat, Hair, Beard, Glasses) while keeping the body visible (1P view).
@@ -720,70 +712,20 @@ Avatar.UpdateHeadLook = function(_tAnim, _nAvatarID, _nCamYaw, _nCamPitch, _nBod
   return _tAnim.nHeadYaw, _tAnim.nHeadPitch
 end
 
-local ApplyLegsTransform = function(_tAnim, _trLocal)
-  if _tAnim == nil or _tAnim.nLegsRig == nil then
-    return
-  end
-  local tWorld = WorldAPIs()
-  local tr = tWorld and tWorld.transform
-  if tr == nil or tr.SetTransform == nil then
-    return
-  end
-  pcall(tr.SetTransform, tr, _tAnim.nLegsRig, _trLocal)
-end
-
--- Computes target lower-body yaw twist (radians) and whether to play the stride clip in reverse
--- from the body-relative horizontal movement angle (_nRelMoveAngle, 0 = forward, +/-pi/2 = strafe, +/-pi = backward).
-Avatar.ComputeLegsTwistTarget = function(_nRelMoveAngle, _nSpeed, _bEnable)
-  if _bEnable ~= true or type(_nRelMoveAngle) ~= "number" or _nRelMoveAngle ~= _nRelMoveAngle or
+-- Computes the unified whole-body yaw offset (radians relative to camera yaw) and whether to play the stride
+-- clip in reverse from the camera-relative horizontal movement angle (_nCamRelMoveAngle: 0 = forward,
+-- +/-pi/2 = strafe, +/-pi = backward). Keeps Torso and Legs 100% unified with zero waist seam disconnection.
+Avatar.ComputeFirstPersonStrafeGoal = function(_nCamRelMoveAngle, _nSpeed, _bEnable)
+  if _bEnable ~= true or type(_nCamRelMoveAngle) ~= "number" or _nCamRelMoveAngle ~= _nCamRelMoveAngle or
     type(_nSpeed) ~= "number" or _nSpeed < c_nWalkExit then
     return 0, false
   end
-  local nRel = WrapAngle(_nRelMoveAngle)
-  if math.abs(nRel) > c_nLegsBackThreshold then
+  local nRel = WrapAngle(_nCamRelMoveAngle)
+  if math.abs(nRel) > c_nFpBackThreshold then
     local nBackAngle = WrapAngle(nRel + math.pi)
-    return Clamp(nBackAngle, -c_nLegsTwistMax, c_nLegsTwistMax), true
+    return Clamp(nBackAngle, -c_nFpBackDiagTurnMax, c_nFpBackDiagTurnMax), true
   end
-  return Clamp(nRel, -c_nLegsTwistMax, c_nLegsTwistMax), false
-end
-
-Avatar.ResetLegsTwist = function(_tAnim)
-  if _tAnim == nil then
-    return
-  end
-  _tAnim.nLegsYaw, _tAnim.nLegsYawVel = 0, 0
-  if not _tAnim.bLegsNeutral then
-    _tAnim.bLegsNeutral = true
-    ApplyLegsTransform(_tAnim, TransformQ.Identity)
-  end
-end
-
--- Smoothly twists the dedicated LegsRig RenderGroup into the strafe/diagonal travel direction in 1P
--- while keeping the Torso aligned with the camera. Returns (nLegsYaw, bReverseStride).
-Avatar.UpdateLegsTwist = function(_tAnim, _nRelMoveAngle, _nSpeed, _nDt, _bEnable)
-  if _tAnim == nil or not _tAnim.bAnimated or _tAnim.nLegsRig == nil then
-    local _, bRev = Avatar.ComputeLegsTwistTarget(_nRelMoveAngle, _nSpeed, _bEnable)
-    return 0, bRev
-  end
-  local nDt = (type(_nDt) == "number" and _nDt > 0) and math.min(_nDt, 0.1) or (1 / 60)
-  local bActive = _bEnable == true and _tAnim.sOverrideSuffix == nil and _tAnim.bOneShotActive ~= true
-  local nTargetYaw, bReverse = Avatar.ComputeLegsTwistTarget(_nRelMoveAngle, _nSpeed, bActive)
-  _tAnim.nLegsYaw, _tAnim.nLegsYawVel = StepDampedSpring(_tAnim.nLegsYaw or 0, _tAnim.nLegsYawVel or 0,
-    nTargetYaw, c_nLegsSpringOmega, nDt)
-  local bSettledNeutral = math.abs(_tAnim.nLegsYaw) < c_nLegsNeutralEps and math.abs(nTargetYaw) < c_nLegsNeutralEps
-  if bSettledNeutral then
-    _tAnim.nLegsYaw, _tAnim.nLegsYawVel = 0, 0
-    if not _tAnim.bLegsNeutral then
-      _tAnim.bLegsNeutral = true
-      ApplyLegsTransform(_tAnim, TransformQ.Identity)
-    end
-    return 0, bReverse
-  end
-  _tAnim.bLegsNeutral = false
-  local trLegs = TransformQ.FromOrPos(Quaternion.FromYawPitchRoll(Vector3:new(_tAnim.nLegsYaw, 0, 0)),
-    Vector3:new(0, 0, 0))
-  ApplyLegsTransform(_tAnim, trLegs)
-  return _tAnim.nLegsYaw, bReverse
+  return Clamp(nRel, -c_nFpStrafeTurnMax, c_nFpStrafeTurnMax), false
 end
 
 -- Attaches a whitelisted prop prefab (from Main_SmallResources.ovl) onto the avatar's hand bone.
@@ -870,7 +812,7 @@ local ResolveDesiredClip = function(_tAnim, _sState)
 end
 
 -- Advances smoothed speed, selects gait/swim/weather/fatigue/idle-variety clip with asymmetric crossfade & stride rate.
-Avatar.UpdateAnimation = function(_tAnim, _nAvatarID, _nSpeed, _nDt, _bInWater, _sWeather, _bIsRemote, _bReverse)
+Avatar.UpdateAnimation = function(_tAnim, _nAvatarID, _nSpeed, _nDt, _bInWater, _sWeather, _bIsRemote, _bReverse, _nTurnRate)
   if _tAnim == nil or not _tAnim.bAnimated or _nAvatarID == nil then
     return
   end
@@ -894,6 +836,12 @@ Avatar.UpdateAnimation = function(_tAnim, _nAvatarID, _nSpeed, _nDt, _bInWater, 
   if nRawSpeed > c_nMaxValidSpeed then
     nRawSpeed = 0
   end
+  local bTurnStepping = false
+  if nRawSpeed < c_nWalkEnter and _bInWater ~= true and _tAnim.sOverrideSuffix == nil and
+    type(_nTurnRate) == "number" and math.abs(_nTurnRate) >= c_nTurnStepMinRate then
+    nRawSpeed = c_nTurnStepVirtualSpeed
+    bTurnStepping = true
+  end
   _tAnim.nPrevSmoothSpeed = _tAnim.nSmoothSpeed
   if nRawSpeed < c_nWalkExit then
     _tAnim.nStopTime = (_tAnim.nStopTime or 0) + nDt
@@ -906,6 +854,9 @@ Avatar.UpdateAnimation = function(_tAnim, _nAvatarID, _nSpeed, _nDt, _bInWater, 
   local nSmoothRate = (nRawSpeed > _tAnim.nSmoothSpeed) and c_nAccelSmoothRate or nDecelRate
   local k = 1 - math.exp(-nSmoothRate * nDt)
   _tAnim.nSmoothSpeed = _tAnim.nSmoothSpeed + (nRawSpeed - _tAnim.nSmoothSpeed) * k
+  if bTurnStepping and _tAnim.nSmoothSpeed < c_nWalkEnter then
+    _tAnim.nSmoothSpeed = c_nWalkEnter
+  end
   if _tAnim.nStopTime >= nStopDelay or _tAnim.nSmoothSpeed < 0.01 then
     _tAnim.nSmoothSpeed = 0
   end
@@ -1020,7 +971,6 @@ Avatar.ResetAnimSpeed = function(_tAnim, _nAvatarID)
   _tAnim.nRoll, _tAnim.nRollVel = 0, 0
   _tAnim.nPitch, _tAnim.nPitchVel = 0, 0
   Avatar.ResetHeadLook(_tAnim)
-  Avatar.ResetLegsTwist(_tAnim)
   if _tAnim.bAnimated and _nAvatarID ~= nil and _tAnim.sOverrideSuffix == nil and _tAnim.sState ~= "idle" then
     local sClip = Avatar.GetClipName(_tAnim.sGroup, "idle")
     if ApplyBaseAnimation(_nAvatarID, sClip, 1.0, c_nBlendStop) then
@@ -1104,20 +1054,6 @@ Avatar.BuildHeadRigPrefab = function()
   }
 end
 
--- Dedicated child RenderGroup for the Legs PeepBodyPart so 1P strafing/diagonals twist lower-body yaw independently
--- of Torso while AnimationProxy (AnimationEntity="../..") continues skinning from the avatar root's BakedAnimation.
-Avatar.BuildLegsRigPrefab = function()
-  return {
-    Components = {
-      Transform = {},
-      AssetPackageProvider = {LoaderPath = ".."},
-      LevelOfDetail = {},
-      RenderBoundingVolume = {LocalCentre = Vector3:new(0, 0.5, 0)},
-      RenderGroup = {LodGroupName = "Characters"},
-    },
-  }
-end
-
 local WaitToken = function(_token)
   while not api.entity.HaveRequestsCompleted(_token) do
     coroutine.yield()
@@ -1152,7 +1088,7 @@ Avatar.CreateAnimated = function(_tAvatar, _nParentID, _sRole, _sInitialClipSuff
       local tHeadParts = {}
       local nPartsSpawned = 0
 
-      -- Spawn dedicated HeadRig and LegsRig RenderGroup children under nAvatarID so head & legs obey SetTransform on GPU.
+      -- Spawn dedicated HeadRig RenderGroup child under nAvatarID so head-group meshes obey SetTransform on GPU.
       local nHeadRigID = nil
       local headRigToken = api.entity.CreateRequestCompletionToken()
       local bRigOk, nRigId = pcall(api.entity.InstantiatePrefab, Avatar.BuildHeadRigPrefab(), "PZ2CoopHeadRig",
@@ -1165,35 +1101,17 @@ Avatar.CreateAnimated = function(_tAvatar, _nParentID, _sRole, _sInitialClipSuff
         Log(_sRole .. " HeadRig spawn failed: " .. tostring(nRigId))
       end
 
-      local nLegsRigID = nil
-      local legsRigToken = api.entity.CreateRequestCompletionToken()
-      local bLegsOk, nLegsId = pcall(api.entity.InstantiatePrefab, Avatar.BuildLegsRigPrefab(), "PZ2CoopLegsRig",
-        legsRigToken, TransformQ.Identity, nAvatarID, true, nil)
-      if bLegsOk and nLegsId ~= nil then
-        nLegsRigID = nLegsId
-        pcall(tWorld.model.SetHidden, tWorld.model, nLegsRigID, true)
-        WaitToken(legsRigToken)
-      else
-        Log(_sRole .. " LegsRig spawn failed: " .. tostring(nLegsId))
-      end
-
       local partsToken = api.entity.CreateRequestCompletionToken()
 
       for _, sPartName in ipairs(c_tPartOrder) do
         local tPartProps = tByPart[sPartName]
         if tPartProps ~= nil and type(tPartProps.ModelName) == "string" and tPartProps.ModelName ~= "" then
           local bHeadPart = IsHeadLookPart(sPartName, tPartProps.ModelName)
-          local bLegsPart = (not bHeadPart) and sPartName == "Legs"
-          local nPartParent = nAvatarID
-          if bHeadPart and nHeadRigID ~= nil then
-            nPartParent = nHeadRigID
-          elseif bLegsPart and nLegsRigID ~= nil then
-            nPartParent = nLegsRigID
-          end
+          local nPartParent = (bHeadPart and nHeadRigID ~= nil) and nHeadRigID or nAvatarID
           local tPartComponents = {
             Model = {BoundingScaler = c_tPartScaler[sPartName] or 10},
           }
-          if nPartParent ~= nAvatarID then
+          if bHeadPart and nHeadRigID ~= nil then
             tPartComponents.AnimationProxy = {AnimationEntity = "../.."}
             tPartComponents.AssetPackageProvider = {LoaderPath = "../.."}
           end
@@ -1247,12 +1165,9 @@ Avatar.CreateAnimated = function(_tAvatar, _nParentID, _sRole, _sInitialClipSuff
         if nHeadRigID ~= nil then
           pcall(tWorld.model.SetHidden, tWorld.model, nHeadRigID, false)
         end
-        if nLegsRigID ~= nil then
-          pcall(tWorld.model.SetHidden, tWorld.model, nLegsRigID, false)
-        end
-        Log(string.format("%s animated avatar ready (id=%s, headRig=%s, legsRig=%s, group=%s, parts=%d, headParts=%d, clip=%s, base=%s)",
-          tostring(_sRole), tostring(nAvatarID), tostring(nHeadRigID), tostring(nLegsRigID), sPrefix, nPartsSpawned, #tHeadParts, sDefaultAnim, tostring(sPrefab)))
-        return nAvatarID, true, {nHeadRig = nHeadRigID, nLegsRig = nLegsRigID, tHeadParts = tHeadParts, nNeckAttach = nNeckAttach}
+        Log(string.format("%s animated avatar ready (id=%s, headRig=%s, group=%s, parts=%d, headParts=%d, clip=%s, base=%s)",
+          tostring(_sRole), tostring(nAvatarID), tostring(nHeadRigID), sPrefix, nPartsSpawned, #tHeadParts, sDefaultAnim, tostring(sPrefab)))
+        return nAvatarID, true, {nHeadRig = nHeadRigID, tHeadParts = tHeadParts, nNeckAttach = nNeckAttach}
       else
         Log(_sRole .. " animated avatar spawned 0 parts; falling back to StartScreenAvatar")
         pcall(api.entity.DestroyEntity, nAvatarID)

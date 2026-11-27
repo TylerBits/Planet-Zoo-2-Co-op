@@ -520,7 +520,12 @@ local OnLakeUpdate = function()
   if not s.bSending or Bridge.IsApplying() or s.nClock < s.nIgnoreUntil or s.nClock < s.nStartedAt + c_nStartupIgnore then
     return
   end
-  s.bDirty = true
+  -- Lakes of a premade blueprint (aquarium water) travel inside it (BuildSync k = "bp"): learn, never send.
+  if BuildSync.IsPremadeQuiet() then
+    s.bAbsorb = true
+  else
+    s.bDirty = true
+  end
   s.nLastChange = s.nClock
 end
 
@@ -577,6 +582,15 @@ WaterSync.Update = function(_nDt, _bSending)
   end
   if not s.bSeeded and s.nClock >= s.nStartedAt + c_nStartupIgnore then
     RefreshSnapshot()
+    return
+  end
+  if s.bAbsorb and not Bridge.IsApplying() and s.nClock - s.nLastChange >= c_nQuiet and BuildSync.IsUndoFree() and
+      not BuildSync.IsPremadeQuiet() then
+    -- Unrelated lake edits in the same quiet spell are absorbed too (same ceiling as BuildSync's window).
+    s.bAbsorb = false
+    s.bDirty = false
+    RefreshSnapshot()
+    Log("lakes of a premade blueprint learned, not sent")
     return
   end
   if not s.bDirty or not _bSending or Bridge.IsApplying() or s.nClock < s.nIgnoreUntil then

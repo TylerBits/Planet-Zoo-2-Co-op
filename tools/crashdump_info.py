@@ -38,7 +38,7 @@ def module_for(mods, addr):
     return None
 
 
-def main(path):
+def main(path, max_refs: int = 60):
     mf = MinidumpFile.parse(path)
     mods = mf.modules.modules
     exc = mf.exception.exception_records[0] if mf.exception else None
@@ -78,7 +78,7 @@ def main(path):
     if syms is None or not syms.ok:
         print("(version.dll refs unsymbolized: dump is not from the local build or no PDB)")
     print("stack refs:")
-    for h in hits[:60]:
+    for h in hits[:max_refs]:
         label = ""
         if syms is not None and syms.ok and h.startswith("version.dll+0x"):
             label = f"  {syms.name(int(h.split('+0x')[1], 16)) or ''}"
@@ -86,4 +86,9 @@ def main(path):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    import argparse
+    ap = argparse.ArgumentParser(description="Inspect a PZ2 crash minidump")
+    ap.add_argument("dump", help="Path to .dmp file")
+    ap.add_argument("--max-refs", type=int, default=60, help="Max stack refs to print")
+    ns = ap.parse_args()
+    main(ns.dump, max_refs=ns.max_refs)

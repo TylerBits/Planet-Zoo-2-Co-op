@@ -61,14 +61,18 @@ local c_nZoomMin, c_nZoomMax, c_nZoomStep = 1.5, 8.0, 0.85 -- mouse wheel: metre
 local c_nFirstPersonSnap = 1.2 -- metres: zooming in closer than this slides into first person
 local c_nZoomRate = 8.0 -- per second: how fast the camera distance eases toward the wheel target
 local c_nBodyHideDist = 0.9 -- metres: closer than this the camera is near/inside the head, so hide head (or static body fallback)
-local c_nFirstPersonBodyBack = 0.16 -- metres: subtle backward body offset in 1P so looking down shows chest/legs instead of hollow neck collar
+local c_nFirstPersonBodyBack = 0.16 -- metres: blend reference for 1P body pullback across the < 0.9 m zoom transition
+local c_nFpEyeAheadOfNeck = 0.14 -- metres: keep animated def_c_neck1_joint this far behind the 1P eye along camYaw
+local c_nFpPitchBackAdd = 0.08 -- metres: extra behind-eye clearance when looking down (> 20 deg) so collar never clips sightline
+local c_nFpNeckSmoothRate = 16.0 -- per second: smooths micro-sway when relaxing from sprint lean back to idle
+local c_nFirstPersonTurnBackAdd = 0.04 -- metres: extra camera-axis clearance when whole body angles sideways during 1P strafing
 local c_nFirstPersonSeatEyeFwd = 0.12 -- metres: subtle forward eye nudge while seated in 1P so looking down shows lap/legs cleanly
 local c_nFirstPersonBodySlack = math.rad(35) -- standing shoulder glance slack in 1P before body pivots smoothly to follow look yaw
 local c_nFollowRate = 12.0 -- per second: how fast the camera's follow point catches up with the player
 local c_nFollowSnap = 10.0 -- metres: farther jumps (teleport, mode switch) are not eased
-local c_nTurnRateSlow = 13.5 -- rad/s crisp turning while standing/slow walking
-local c_nTurnRateFast = 6.0 -- rad/s weighted GTA-style turning arc while sprinting
-local c_nTurnMinSpeed = 0.3 -- m/s: slower than this the body keeps its facing
+local c_nTurnRateSlow = 7.5 -- rad/s grounded turning pace (~0.42s for 180 deg so turns match footsteps instead of mannequin-spinning)
+local c_nTurnRateFast = 5.5 -- rad/s weighted GTA-style turning arc while sprinting
+local c_nTurnMinSpeed = 0.42 -- m/s: above c_nWalkEnter (0.40) so sub-walk micro-glides never spin the body in idle
 local c_nPivotMinSpeed = 1.2 -- m/s threshold for 180-deg turn one-shot
 local c_nSwimDepth = 0.75 -- metres of water above feet before switching to swimming (waist/chest deep)
 local c_nSwimWaterlineOffset = 1.25 -- feet sit this far below lake surface so head/shoulders float naturally
@@ -944,6 +948,7 @@ local UpdateFriend = function(_nDt)
             local nExcess = nLookDiff > 0 and (nLookDiff - nBodySlack) or (nLookDiff + nBodySlack)
             local nStep = Clamp(nExcess, -c_nTurnRateSlow * _nDt, c_nTurnRateSlow * _nDt)
             s.nFriendBodyYaw = WrapAngle(s.nFriendBodyYaw + nStep)
+            nFriendYawRate = nStep / _nDt
           end
         end
         -- Blend rendered speed with recent smoothed peer velocity so brief inter-packet troughs never stutter to idle.
@@ -996,7 +1001,8 @@ local UpdateFriend = function(_nDt)
             Avatar.ClearBaseOverride(tBody.tAnim, tBody.nAvatar, 0.18)
           end
         end
-        Avatar.UpdateAnimation(tBody.tAnim, tBody.nAvatar, nFriendSpeed, _nDt, bInWater, s.sWeather, true)
+        Avatar.UpdateAnimation(tBody.tAnim, tBody.nAvatar, nFriendSpeed, _nDt, bInWater, s.sWeather, true, false,
+          t.m == 1 and nFriendYawRate or 0)
         local bFriendSeatedIdle = tVehFriend ~= nil or (s.tFriendSeatOverride ~= nil and
           (s.tFriendSeatOverride.phase == nil or s.tFriendSeatOverride.phase == "seated"))
         Avatar.UpdateHeadLook(tBody.tAnim, tBody.nAvatar, sh.yaw, sh.pitch or 0, s.nFriendBodyYaw, nPitch,
@@ -2256,7 +2262,7 @@ local DestroyOwnBody = function()
     Destroy(s.tOwnBody.tParent)
   end
   s.tOwnBody, s.tOwnPrev, s.nBodyYaw, s.nOwnGroundY, s.nOwnSpeed, s.nOwnSmoothSpeed = nil, nil, nil, nil, 0, 0
-  s.nOwnYawRate, s.bOwnInWater, s.nOwnWaterSurface, s.nBobAmp = 0, false, nil, 0
+  s.nOwnYawRate, s.bOwnInWater, s.nOwnWaterSurface, s.nBobAmp, s.tFpNeckLocal = 0, false, nil, 0, nil
 end
 
 local TurnBody = function(_t, _nDt)
@@ -2271,36 +2277,42 @@ local TurnBody = function(_t, _nDt)
     local nCurYaw = s.nBodyYaw ~= nil and s.nBodyYaw or _t.yaw
     local tNextPrev = {x = _t.x, z = _t.z}
     local nSpeed = 0
-    local nRelMoveAngle = nil
+    local nCamRelMove = nil
     if s.tOwnPrev ~= nil and _nDt > 0 then
       local dx, dz = _t.x - s.tOwnPrev.x, _t.z - s.tOwnPrev.z
       local nDist = math.sqrt(dx * dx + dz * dz)
       if nDist <= c_nSnapDistance then
         nSpeed = nDist / _nDt
         if nDist > 1e-4 then
-          nRelMoveAngle = WrapAngle(math.atan(dx, dz) - nCurYaw)
+          nCamRelMove = WrapAngle(math.atan(dx, dz) - _t.yaw)
         end
       end
     end
+    local nStrafeOffset, bReverseStride = Avatar.ComputeFirstPersonStrafeGoal(nCamRelMove, nSpeed, not s.bOwnInWater)
     local nYawRate = 0
     if _nDt > 0 then
-      local nLookDiff = WrapAngle(_t.yaw - nCurYaw)
       if nSpeed >= c_nTurnMinSpeed then
+        -- Unified whole-body directional turn: torso & legs turn smoothly together into strafe/diagonal travel.
+        local nGoalYaw = WrapAngle(_t.yaw + nStrafeOffset)
+        local nDiff = WrapAngle(nGoalYaw - nCurYaw)
         local nMax = c_nTurnRateSlow * _nDt
-        local nDelta = Clamp(nLookDiff, -nMax, nMax)
+        local nDelta = Clamp(nDiff, -nMax, nMax)
         nCurYaw = WrapAngle(nCurYaw + nDelta)
         nYawRate = nDelta / _nDt
-      elseif math.abs(nLookDiff) > c_nFirstPersonBodySlack then
-        local nExcess = nLookDiff > 0 and (nLookDiff - c_nFirstPersonBodySlack) or (nLookDiff + c_nFirstPersonBodySlack)
-        local nMax = c_nTurnRateSlow * _nDt
-        local nDelta = Clamp(nExcess, -nMax, nMax)
-        nCurYaw = WrapAngle(nCurYaw + nDelta)
-        nYawRate = nDelta / _nDt
+      else
+        local nLookDiff = WrapAngle(_t.yaw - nCurYaw)
+        if math.abs(nLookDiff) > c_nFirstPersonBodySlack then
+          local nExcess = nLookDiff > 0 and (nLookDiff - c_nFirstPersonBodySlack) or (nLookDiff + c_nFirstPersonBodySlack)
+          local nMax = c_nTurnRateSlow * _nDt
+          local nDelta = Clamp(nExcess, -nMax, nMax)
+          nCurYaw = WrapAngle(nCurYaw + nDelta)
+          nYawRate = nDelta / _nDt
+        end
       end
     end
     s.nBodyYaw = nCurYaw
     s.tOwnPrev = tNextPrev
-    return nSpeed, nYawRate, false, false, nRelMoveAngle
+    return nSpeed, nYawRate, false, false, bReverseStride
   end
   local nNextYaw, tNextPrev, nSpeed, nYawRate, bRev, bLeft =
     StepBodyYaw(s.tOwnPrev, s.nBodyYaw, _t.x, _t.z, _t.yaw, _nDt)
@@ -2490,7 +2502,6 @@ local UpdateOwnBody = function(_nDt)
       end
       s.bOwnVehicleOverrideWasActive = true
       Avatar.UpdateAnimation(tBody.tAnim, tBody.nAvatar, 0, _nDt, false, s.sWeather)
-      Avatar.ResetLegsTwist(tBody.tAnim)
       -- Keep CPU neck bone fresh so Vehicles can read exact $OnRideSitIdle neck height in both 1P and 3P.
       if tBody.tAnim ~= nil and tBody.tAnim.nNeckAttach ~= nil then
         pcall(function()
@@ -2586,7 +2597,7 @@ local UpdateOwnBody = function(_nDt)
     end
     return
   end
-  local nOwnSpeed, nYawRate, bRev, bLeft, nRelMoveAngle = TurnBody(t, _nDt)
+  local nOwnSpeed, nYawRate, bRev, bLeft, bReverseStride = TurnBody(t, _nDt)
   s.nOwnSpeed = nOwnSpeed
   s.nOwnYawRate = nYawRate
   local nClampedSpeed = (type(nOwnSpeed) == "number" and nOwnSpeed <= 15.0) and nOwnSpeed or 0
@@ -2618,14 +2629,54 @@ local UpdateOwnBody = function(_nDt)
   local nPitch, nRoll = 0, 0
   if tBody.tAnim ~= nil then
     nPitch, nRoll = Avatar.StepBodyLean(tBody.tAnim, nYawRate, nOwnSpeed, _nDt, bInWater, nSlopeRad)
-    if t.bFirstPerson == true and nPitch > 0.08 then
-      nPitch = 0.08
+    if t.bFirstPerson == true then
+      nPitch = 0
     end
   end
   local nBack = (type(t.nFpBodyBack) == "number" and t.nFpBodyBack > 0) and t.nFpBodyBack or 0
   local nPlaceYaw = s.nBodyYaw or t.yaw or 0
-  Place(tBody.tParent, t.x - math.sin(nPlaceYaw) * nBack, s.nOwnGroundY, t.z - math.cos(nPlaceYaw) * nBack,
-    nPlaceYaw, nPitch, nRoll)
+  local nPlaceX, nPlaceZ = t.x, t.z
+  if nBack > 0 then
+    local nFpBlend = Clamp(nBack / c_nFirstPersonBodyBack, 0, 1)
+    local nBackYaw = (type(t.camYaw) == "number") and t.camYaw or nPlaceYaw
+    -- Keep live CPU neck bone fresh in 1P so baked WalkBase/RunBase forward torso lean is compensated automatically.
+    if tBody.nAvatar ~= nil and tBody.tAnim ~= nil and tBody.tAnim.nNeckAttach ~= nil then
+      pcall(function()
+        local baked = WorldAPIs().bakedanimation
+        if baked ~= nil and baked.RequestAllBonesForCalculate ~= nil then
+          baked:RequestAllBonesForCalculate(tBody.nAvatar)
+        end
+      end)
+    end
+    local nx, _, nz = Avatar.GetLocalNeckPivot(tBody.tAnim, tBody.nAvatar)
+    local nNeckDt = (type(_nDt) == "number" and _nDt > 0) and math.min(_nDt, 0.1) or (1 / 60)
+    local tNL = s.tFpNeckLocal
+    if tNL == nil then
+      tNL = {x = nx, z = nz}
+      s.tFpNeckLocal = tNL
+    else
+      local kNeck = 1 - math.exp(-c_nFpNeckSmoothRate * nNeckDt)
+      tNL.x = tNL.x + (nx - tNL.x) * kNeck
+      -- Snap forward lean immediately so RunBase never pokes the collar in front of the camera for even 1 frame;
+      -- ease smoothly when relaxing back to upright idle.
+      if nz > tNL.z then
+        tNL.z = nz
+      else
+        tNL.z = tNL.z + (nz - tNL.z) * kNeck
+      end
+    end
+    local cy, sy = math.cos(nPlaceYaw), math.sin(nPlaceYaw)
+    local wx = tNL.x * cy + tNL.z * sy
+    local wz = -tNL.x * sy + tNL.z * cy
+    local nPitchDownT = Clamp(((t.pitch or 0) - 0.35) / 0.85, 0, 1)
+    local nTurnClearance = c_nFirstPersonTurnBackAdd * math.abs(math.sin(WrapAngle(nPlaceYaw - nBackYaw)))
+    local nNeckBehindEye = c_nFpEyeAheadOfNeck + c_nFpPitchBackAdd * nPitchDownT + nTurnClearance
+    nPlaceX = t.x - (math.sin(nBackYaw) * nNeckBehindEye + wx) * nFpBlend
+    nPlaceZ = t.z - (math.cos(nBackYaw) * nNeckBehindEye + wz) * nFpBlend
+  else
+    s.tFpNeckLocal = nil
+  end
+  Place(tBody.tParent, nPlaceX, s.nOwnGroundY, nPlaceZ, nPlaceYaw, nPitch, nRoll)
   local bOk, sError = pcall(AdvanceOwnAvatar, tBody, _nDt)
   if not bOk then
     Log("own avatar error: " .. tostring(sError))
@@ -2660,9 +2711,9 @@ local UpdateOwnBody = function(_nDt)
     if bRev then
       Avatar.TriggerPivot180(tBody.tAnim, tBody.nAvatar, bLeft)
     end
-    local bUseLegsSplit = (t.bFirstPerson == true) and (not bInWater) and (s.tSeatOverride == nil)
-    local _, bReverseStride = Avatar.UpdateLegsTwist(tBody.tAnim, nRelMoveAngle, nOwnSpeed, _nDt, bUseLegsSplit)
-    Avatar.UpdateAnimation(tBody.tAnim, tBody.nAvatar, nOwnSpeed, _nDt, bInWater, s.sWeather, false, bReverseStride)
+    local bAllowRev = bReverseStride == true and (not bInWater) and (s.tSeatOverride == nil)
+    local nTurnStepRate = (s.tSeatOverride == nil) and nYawRate or 0
+    Avatar.UpdateAnimation(tBody.tAnim, tBody.nAvatar, nOwnSpeed, _nDt, bInWater, s.sWeather, false, bAllowRev, nTurnStepRate)
     local bWantHeadHide = t.bHeadHidden == true
     local bCanHideHeadOnly = tBody.tAnim ~= nil and
       (tBody.tAnim.nHeadRig ~= nil or (type(tBody.tAnim.tHeadParts) == "table" and #tBody.tAnim.tHeadParts > 0))
@@ -2694,6 +2745,23 @@ local HandleToggleKey = function()
   if CurrentUIMode() == "WalkingCamera" and WorldAPIs().InputManager:GetKeyPressed("GameCamera_ToggleThirdPerson") then
     Presence.SetThirdPerson(not s.bThirdPerson)
   end
+end
+
+-- ` (key left of 1, reported by version.dll) = HUD Camera -> Explore button: drag the avatar to a drop spot.
+-- Same camera modes vanilla's own GameCamera_WalkingCam key allows (components.cameras.cameramodemanager.lua).
+local c_tExploreHotkeyCamModes = {Standard = true, Freelook = true, Focus = true}
+
+local HandleExploreHotkey = function()
+  if not Bridge.TakeExploreHotkey() then
+    return
+  end
+  local sUIMode = CurrentUIMode()
+  local sCamMode = WorldAPIs().CameraModeManager:GetCurrentModeName()
+  if sUIMode == "WalkingCameraInit" or not c_tExploreHotkeyCamModes[sCamMode] then
+    return
+  end
+  require("Editors.Shared.BaseUIMode").SetNewMode("WalkingCameraInit")
+  Log("explore hotkey: entered WalkingCameraInit from " .. tostring(sUIMode) .. "/" .. tostring(sCamMode))
 end
 
 -- ---- explore placement preview (Camera -> Explore / WalkingCameraInit) --------------------------
@@ -3572,6 +3640,11 @@ Presence.Update = function(_nDt, _bActive)
     s.bKeyErrorLogged = true
     Log("third person key error: " .. tostring(sKeyError))
   end
+  local bExploreKey, sExploreKeyError = pcall(HandleExploreHotkey)
+  if not bExploreKey and not s.bExploreKeyErrorLogged then
+    s.bExploreKeyErrorLogged = true
+    Log("explore hotkey error: " .. tostring(sExploreKeyError))
+  end
   if _bActive and (Bridge.IsPeerConnected() or Bridge.IsLoopback()) then
     -- Hydrate from Bridge cache if a peer avatar arrived during loading/resync before this park started.
     if s.tFriendAvatarData == nil and Bridge.GetCachedPeerAvatar ~= nil then
@@ -3838,12 +3911,20 @@ Presence.SetOpenPortal = function(_sKey, _tPortal)
   s.tOpenPortals[_sKey] = _tPortal
 end
 
+Presence.GetOpenPortals = function()
+  return s.tOpenPortals
+end
+
 Presence.ClearOpenPortals = function()
   s.tOpenPortals = {}
 end
 
 Presence.SetClosedDoorCheck = function(_fn)
   s.fnHasClosedDoorAt = _fn
+end
+
+Presence.HasClosedDoorAt = function(_x, _y, _z)
+  return s.fnHasClosedDoorAt ~= nil and s.fnHasClosedDoorAt(_x, _y, _z) == true
 end
 
 Presence.IsAquariumStaffDoorEntity = IsAquariumStaffDoorEntity
@@ -3899,7 +3980,7 @@ Presence.Reset = function()
   s.sAvatarPeerKey = nil
   s.tFollow, s.tOwnPrev, s.nBodyYaw, s.nOwnGroundY, s.nOwnSpeed, s.nOwnSmoothSpeed = nil, nil, nil, nil, 0, 0
   s.nOwnYawRate, s.bOwnInWater, s.nOwnWaterSurface = 0, false, nil
-  s.nSprintBlend, s.nBobPhase, s.nBobAmp, s.nOcclRatio = 0, 0, 0, nil
+  s.nSprintBlend, s.nBobPhase, s.nBobAmp, s.nOcclRatio, s.tFpNeckLocal = 0, 0, 0, nil, nil
   s.bOwnUnavailable = false
   s.bLabelShown = false
   s.bPromptAdded = false

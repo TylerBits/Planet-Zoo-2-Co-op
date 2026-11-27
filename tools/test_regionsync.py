@@ -5,6 +5,7 @@ fence edit end to end: spatial change message -> settle -> query -> blueprint / 
 then the same packets applied on the "friend's" side (shifted 50 m like solo mode): own content removed,
 new content placed / rebuilt. Catches runtime errors the syntax check cannot. Needs: pip install lupa.
 """
+import json
 import pathlib
 import re
 import sys
@@ -15,6 +16,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SOURCES = {
     "PZ2Coop.BuildSync": (ROOT / "src" / "ovl_mod" / "pz2coop.buildsync.lua").read_text(encoding="utf-8"),
     "PZ2Coop.RegionSync": (ROOT / "src" / "ovl_mod" / "pz2coop.regionsync.lua").read_text(encoding="utf-8"),
+    "PZ2Coop.RegionSync_Logic": (ROOT / "src" / "ovl_mod" / "pz2coop.regionsync_logic.lua").read_text(encoding="utf-8"),
 }
 
 
@@ -83,6 +85,7 @@ local tWorldAPIs = {
         AddControlPost = function(_, p) call("AddControlPost", p) end,
         AddPanel = function(_, p) call("AddPanel", p) end,
         RefreshAdjacentPosts = function() call("RefreshAdjacentPosts") end,
+        RemoveRoof = function(_, id) call("RemoveRoof", id) end,
         IsLakesInLimboEnabled = function(self) return self.bLimbo end,
         SetLakesInLimboEnabled = function(self, b) self.bLimbo = b call("SetLakesInLimboEnabled", b) end}
       local h = {}
@@ -109,12 +112,15 @@ local tWorldAPIs = {
   habitatboundary = {
     GetBoundaryObjectFromEntity = function(_, e)
       if e == 21 then return true, nil, post21 elseif e == 22 then return true, nil, post22
-      elseif e == 31 then return true, panel31, nil end
+      elseif e == 31 then return true, panel31, nil
+      -- roof nets: 41 belongs to a neighbour habitat (9) whose fences are not replaced, 42 to habitat 5
+      elseif e == 41 then return true, nil, nil, nil, nil, 900 elseif e == 42 then return true, nil, nil, nil, nil, 901 end
       return false
     end,
     GetPanelsConnectedToControlPost = function(_, p) return {panel31} end,
     GetHabitatsFromBoundaryObject = function() if openFence then return {} end return {[5] = true} end,
     GetRoof = function() return nil end,
+    GetRoofHabitat = function(_, r) return r == 900 and 9 or 5 end,
     GetBoundaryObjectsForHabitat = function()
       return {tPanels = {[panel31] = true}, tControlPosts = {[post21] = true, [post22] = true}, tAttachableProps = {}}
     end,
@@ -187,8 +193,10 @@ require = function(name)
   if loaded[name] then return loaded[name] end
   if SOURCES[name] then
     local captured
+    local prevModule = module -- a nested require (RegionSync -> RegionSync_Logic) must not steal this one
     module = function() captured = {} return captured end
-    load(SOURCES[name], name)()
+    load(SOURCES[name], name)(name)
+    module = prevModule
     loaded[name] = captured
     return captured
   end
@@ -286,9 +294,16 @@ assert(#packets == nPackets + 1, "own stroke right after a remote apply was drop
 -- 4) friend side, fence: own fence demolished (first commit), habitat blueprint placed (second commit)
 calls = {}
 boxes[31] = boxes[131]
+boxes[41], boxes[42] = boxes[131], boxes[131]
+queryResult[FLAG_FENCE] = {31, 41, 42}
 fp.d.ox = 5000
 RegionSync.OnPacket({nType = 0x22, sFile = "/run/PZ2Coop/" .. fp.f, tData = fp.d})
 tick(30)
+queryResult[FLAG_FENCE] = {31}
+-- only the net of the habitat being replaced is removed; a neighbour's net hit by the area query stays
+-- (the solo mirror deleted the host's aviary net)
+assert(count("RemoveRoof") == 1 and lastCall("RemoveRoof").args[1] == 5 and has("kept 1 roof"),
+  "wrong roofs removed:\n" .. dump())
 assert(count("DeleteMultiSelection") == 1 and count("LoadBlueprintFromFile") == 1 and count("CommitPreview") == 2,
   "fence apply incomplete:\n" .. dump())
 assert(count("AddControlPost") == 0 and count("AddPanel") == 0, "fences must not be built by hand")
@@ -356,12 +371,139 @@ tick(40)
 api.undo.CanCommitPreview = savedCanCommit
 assert(count("SaveBlueprintToFile") >= 1 and count("LoadBlueprintFromFile") >= 3 and count("CommitPreview") == 2,
   "fence backup restore failed: saves=" .. count("SaveBlueprintToFile") .. " loads=" .. count("LoadBlueprintFromFile") .. " commits=" .. count("CommitPreview") .. "\n" .. dump())
+-- premade blueprint (sent whole as BuildSync k = "bp"): its fences/paths are not sent as regions
+local nPk = #packets
+local mo = {GetTransform = function() return {GetPosition = function() return vec(10, 0, 0) end,
+  GetOrientation = function() return {ToYawPitchRoll = function() return vec(0, 0, 0) end} end} end}
+BuildSync.NotePremadeCommit({blueprintID = 42}, mo)
+queryResult[FLAG_PATH] = {11, 12}
+boxes[31] = box31Local
+spatial(FLAG_PATH, 9, 13)
+spatial(FLAG_FENCE, 5, 9)
+tick(40)
+assert(#packets == nPk and has("premade blueprint sent whole, not sent as regions"),
+  "premade pieces sent as regions:\n" .. dump())
+spatial(FLAG_PATH, 9, 13) -- window over: edits are sent again
+tick(25)
+assert(#packets == nPk + 1 and packets[#packets].d.k == "path", "edit after the premade window not sent:\n" .. dump())
 assert(not has("job failed") and not has("error"), dump())
 return "ok: " .. BuildSync.Summary()
 """
 
 
+SNAPSHOT = ROOT / "tools" / "fixtures" / "retail_path_snapshot.json"
+SNAP_RE = re.compile(r"PZ2SNAP (area|hit|spatial|meta) (.*)$")
+
+
+def import_snapshot(diag_log: pathlib.Path) -> dict:
+    """Last complete PZ2SNAP block in diag.log (tools/eval_probes/dump_path_snapshot.lua) -> fixture dict."""
+    block: list[tuple[str, list[str]]] = []
+    done: list[tuple[str, list[str]]] | None = None
+    for line in diag_log.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = SNAP_RE.search(line)
+        if m is None:
+            continue
+        kind, rest = m.group(1), m.group(2).split()
+        if kind == "area" and rest[0] == "ref":
+            block = []
+        block.append((kind, rest))
+        if kind == "meta":
+            done = block
+    if done is None:
+        raise SystemExit(f"FAIL: no complete PZ2SNAP block in {diag_log}")
+    snap: dict = {"areas": {}, "hits": [], "spatial": []}
+    for kind, rest in done:
+        if kind == "area":
+            snap["areas"][rest[0]] = [float(v) for v in rest[1:7]]
+        elif kind == "hit":
+            snap["hits"].append([int(rest[0]), None if rest[1] == "nil" else int(rest[1]), [float(v) for v in rest[2:8]]])
+        elif kind == "spatial":
+            snap["spatial"].append([int(rest[0]), [float(v) for v in rest[1:7]]])
+        else:
+            snap["expref"], snap["flag_path"] = int(rest[0]), int(rest[1])
+            if (int(rest[2]), int(rest[3])) != (len(snap["hits"]), len(snap["spatial"])):
+                raise SystemExit(f"FAIL: PZ2SNAP block incomplete (meta {rest[2:4]}, read {len(snap['hits'])} hits, "
+                                 f"{len(snap['spatial'])} spatial): the bridge dropped lines")
+    if snap["expref"] < 1 or not snap["hits"] or {"ref", "probe", "mirror"} - set(snap["areas"]):
+        raise SystemExit("FAIL: PZ2SNAP block has no expref, hits or areas")
+    return snap
+
+
+# Retail geometry replayed through the pure logic exactly as QueryPathChunks feeds it (sender side).
+REPLAY = r"""
+local snap = SNAP
+require = function() return nil end
+load(LOGIC_SRC, "PZ2Coop.RegionSync_Logic")()
+local L = _G.__PZ2CoopRegionSyncLogic
+local function box(a) return {x0 = a[1], y0 = a[2], z0 = a[3], x1 = a[4], y1 = a[5], z1 = a[6]} end
+local ref, probe, mirror = box(snap.areas.ref), box(snap.areas.probe), box(snap.areas.mirror)
+local q = L.Expand(ref, 20) -- c_nWholeChunkM
+local order, byChunk, whole = {}, {}, {}
+for i = 1, #snap.hits do
+  local h = snap.hits[i]
+  local b = box(h[3])
+  if h[2] ~= nil and L.Overlaps(b, q) then
+    whole[h[2]] = L.BoxUnion(whole[h[2]], b)
+    if L.Overlaps(b, ref) then
+      if byChunk[h[2]] == nil then
+        table.insert(order, h[2])
+        byChunk[h[2]] = b
+      else
+        byChunk[h[2]] = L.BoxUnion(byChunk[h[2]], b)
+      end
+    end
+  end
+end
+local sel, nAdded = L.PlanPathChunks(ref, nil, order, byChunk, whole, function() return nil end)
+local nRef, nMirror = 0, 0
+for _, c in ipairs(sel) do
+  if L.Inside(whole[c], L.Expand(probe, 1)) then nRef = nRef + 1 end
+  if L.Inside(whole[c], L.Expand(mirror, 1)) then nMirror = nMirror + 1 end
+end
+local nPathMsgs, rAcc = 0, nil
+for i = 1, #snap.spatial do
+  local m = snap.spatial[i]
+  if L.HasFlag(m[1], snap.flag_path) then
+    nPathMsgs = nPathMsgs + 1
+    local a = m[2]
+    local v = function(x, y, z) return {GetX = function() return x end, GetY = function() return y end, GetZ = function() return z end} end
+    rAcc = L.Grow(rAcc, v(a[1], a[2], a[3]), v(a[4], a[5], a[6]))
+  end
+end
+return nRef, nMirror, #sel, nAdded, nPathMsgs, rAcc ~= nil
+"""
+
+
+def replay_snapshot() -> str:
+    if not SNAPSHOT.is_file():
+        return "replay SKIP (no tools/fixtures/retail_path_snapshot.json yet)"
+    snap = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    lua = lupa.LuaRuntime()
+    to_lua = lambda v: lua.table_from(*(to_lua(x) for x in v)) if isinstance(v, list) else (  # noqa: E731
+        lua.table_from({k: to_lua(x) for k, x in v.items()}) if isinstance(v, dict) else v)
+    lua.globals().SNAP = to_lua(snap)
+    lua.globals().LOGIC_SRC = SOURCES["PZ2Coop.RegionSync_Logic"]
+    n_ref, n_mirror, n_sel, n_added, n_path_msgs, acc_ok = lua.execute(REPLAY)
+    exp = snap["expref"]
+    assert n_ref == exp, f"retail replay: sender selects {n_ref} of the {exp} reference chunks ({n_sel} selected)"
+    assert n_mirror == 0, f"retail replay: sender also selects {n_mirror} chunk(s) of the mirror copy"
+    assert n_path_msgs > 0 and acc_ok, f"retail replay: {n_path_msgs} path-flag spatial messages, region={acc_ok}"
+    return f"replay ok: {n_ref}/{exp} ref chunks, {n_added} added by area growth, {n_path_msgs} path msgs"
+
+
 def main() -> int:
+    if "--import-snapshot" in sys.argv:
+        sys.path.insert(0, str(ROOT / "tools"))
+        from extract_all_lua import find_game_dir
+        game = find_game_dir()
+        if game is None:
+            raise SystemExit("FAIL: game not installed")
+        snap = import_snapshot(pathlib.Path(game) / "PZ2Coop" / "diag.log")
+        SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
+        SNAPSHOT.write_text(json.dumps(snap, separators=(",", ":")) + "\n", encoding="utf-8")
+        print(f"wrote {SNAPSHOT.relative_to(ROOT)}: {len(snap['hits'])} hits, {len(snap['spatial'])} spatial, "
+              f"expref={snap['expref']}")
+        return 0
     lua = lupa.LuaRuntime()
     sources = lua.table()
     for name, text in SOURCES.items():
@@ -371,10 +513,11 @@ def main() -> int:
         harness = HARNESS.replace("@FLAG_PATH@", str(FLAGS["Flag_Path"])).replace(
             "@FLAG_FENCE@", str(FLAGS["Flag_HabitatBoundary"]))
         result = lua.execute(harness + CHECKS)
-    except lupa.LuaError as error:
+        replay = replay_snapshot()
+    except (lupa.LuaError, AssertionError) as error:
         print("FAIL:", error)
         return 1
-    print(result)
+    print(f"{result} | {replay}")
     return 0
 
 
