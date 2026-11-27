@@ -222,6 +222,10 @@ local StepParkHost = function()
       SetStage("ep_enter")
     elseif s.sPlan == "mirror_place" then
       SetStage("mp_setup")
+    elseif s.sPlan == "host_stress" then
+      Bridge.SetLoopback(false)
+      s.hs = nil
+      SetStage("hs_cycle")
     else
       Bridge.SetLoopback(true)
       SetStage("test_notifications")
@@ -2431,6 +2435,85 @@ local StepMPCase = function()
   end
 end
 
+-- ---- plan "host_stress": leave + host again, many times -------------------------------------------------
+-- Reproduces the steamclient64 access violation inside CreateListenSocketP2P right after CreateLobby
+-- completes (crash dumps 2026-11-27 4:00 pm; steam_p2p.cpp pollPendingCall). The gap before each host varies
+-- (0 .. 1.6 s) so the lobby call lands at different points of the game's frame, and each host starts while an
+-- aquarium blueprint (test_aquarium.bin) is being placed: the player crash came while placing an aquarium.
+-- The open Co-op menu's status + friends polls (with avatar fetches, reset every cycle) run all the time, as
+-- they do when a player hosts from the menu.
+-- 15 cycles: Steam answers CreateLobby with k_EResultTimeout (16) after ~21 quick creates (run 94a531d9) and
+-- keeps throttling for minutes; a throttled cycle waits c_nThrottleWait and retries (not a crash, not a FAIL
+-- unless it happens more than c_nMaxThrottles times).
+-- PASS: every cycle got a room code and the game is still alive (a crash ends the run without AUTOTEST_DONE;
+-- the runner reports the dump).
+local c_nHostCycles = 15
+local c_nThrottleWait = 30.0
+local c_nMaxThrottles = 4
+local StepHSCycle = function()
+  local hs = s.hs
+  if hs == nil then
+    local vCam = api.world.GetWorldAPIs().CameraModeManager:GetPosYPRZoom()
+    hs = {nCycle = 1, nOk = 1, sPhase = "leave", nAt = 0, -- cycle 1 = the host_room check that got us here
+      cx = vCam:GetX() - 60, cz = vCam:GetZ(), nThrottled = 0}
+    s.hs = hs
+    Bridge.SendCommand("leave")
+    return
+  end
+  local nT = s.nStageTime - hs.nAt
+  if s.nStageTime >= (hs.nNextPoll or 0) then
+    hs.nNextPoll = s.nStageTime + 0.25
+    Bridge.SendCommand("status")
+    Bridge.SendCommand("friends", hs.bAvatarsReset and nil or {reset = "1"})
+    hs.bAvatarsReset = true
+  end
+  if hs.sPhase == "leave" then
+    if Bridge.GetRole() == "none" then
+      hs.sPhase, hs.nAt = "gap", s.nStageTime
+    elseif nT >= 10.0 then
+      hs.sFail = "leave timed out at cycle " .. hs.nCycle
+    end
+  elseif hs.sPhase == "gap" then
+    if nT >= (hs.nCycle % 5) * 0.4 + (hs.bRetry and c_nThrottleWait or 0) then
+      if not hs.bRetry then
+        hs.nCycle = hs.nCycle + 1
+      end
+      hs.bRetry = false
+      Bridge.GetSession().sError = nil
+      hs.bAvatarsReset = false
+      Bridge.Log("autotest: host_stress cycle " .. hs.nCycle .. " host + aquarium place")
+      local x, z = hs.cx + 40 * (hs.nCycle % 4), hs.cz + 40 * math.floor(hs.nCycle / 4)
+      local y = RaycastGroundY(x, z, 0)
+      require("PZ2Coop.BuildSync").OnPacket({nType = 0x20, sFile = Bridge.GetPrefix() .. "test_aquarium.bin",
+        tData = {x = math.floor(x * 100 + 0.5), y = math.floor(y * 100 + 0.5) + 867, z = math.floor(z * 100 + 0.5)}})
+      Bridge.SendCommand("host")
+      hs.sPhase, hs.nAt = "host", s.nStageTime
+    end
+  elseif hs.sPhase == "host" then
+    if Bridge.GetRole() == "host" and Bridge.GetSession().sCode ~= nil then
+      hs.nOk = hs.nOk + 1
+      if hs.nCycle >= c_nHostCycles then
+        hs.sPhase = "done"
+      else
+        Bridge.SendCommand("leave")
+        hs.sPhase, hs.nAt = "leave", s.nStageTime
+      end
+    elseif Bridge.GetSession().sError == "create_lobby_failed" and hs.nThrottled < c_nMaxThrottles then
+      hs.nThrottled = hs.nThrottled + 1
+      Bridge.Log("autotest: host_stress cycle " .. hs.nCycle .. " CreateLobby throttled, retrying")
+      hs.bRetry = true
+      hs.sPhase, hs.nAt = "gap", s.nStageTime
+    elseif nT >= 20.0 then
+      hs.sFail = "no room code at cycle " .. hs.nCycle .. " (err=" .. tostring(Bridge.GetSession().sError) .. ")"
+    end
+  end
+  if hs.sFail ~= nil or hs.sPhase == "done" then
+    Record("host_stress", hs.sFail == nil and hs.nOk == c_nHostCycles,
+      string.format("cycles=%d ok=%d throttled=%d fail=%s", hs.nCycle, hs.nOk, hs.nThrottled, tostring(hs.sFail)))
+    SetStage("cleanup")
+  end
+end
+
 local c_tStages = {
   wait_menu = StepMenu,
   wait_park = StepWaitPark,
@@ -2463,6 +2546,7 @@ local c_tStages = {
   ep_exit = StepEPExit,
   mp_setup = StepMPSetup,
   mp_case = StepMPCase,
+  hs_cycle = StepHSCycle,
   cleanup = StepCleanup,
 }
 

@@ -2,8 +2,11 @@ r"""Print exception, faulting module and stack module refs for a PZ2 crash minid
 
 Dumps: %LOCALAPPDATA%\Temp\Frontier Developments\Planet Zoo 2\CrashDumps\*.dmp (newest = last crash).
 Run: python tools/crashdump_info.py <file.dmp>   (needs: pip install minidump). Stack refs are raw values,
-so some are stale leftovers, not live frames.
+so some are stale leftovers, not live frames. version.dll refs get function + source line from
+build/proxy_dll/Release/version.pdb (tools/pdb_symbols.py) when the dump's version.dll is that exact build;
+for an older build: python tools/pdb_symbols.py --from <copy of that dll> <offsets>.
 """
+import pathlib
 import struct
 import sys
 
@@ -12,6 +15,20 @@ import logging
 from minidump.minidumpfile import MinidumpFile
 
 logging.disable(logging.CRITICAL)  # the PEB parse error on these dumps is harmless
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import pdb_symbols  # noqa: E402
+
+
+def local_build_matches(mods) -> bool:
+    """True when the dump's version.dll is build/proxy_dll/Release/version.dll (same PE timestamp and size)."""
+    mod = next((m for m in mods if m.name.lower().endswith("\\version.dll")), None)
+    if mod is None or not pdb_symbols.DLL.is_file():
+        return False
+    d = pdb_symbols.DLL.read_bytes()
+    pe = struct.unpack_from("<I", d, 0x3C)[0]
+    stamp = struct.unpack_from("<I", d, pe + 8)[0]
+    size = struct.unpack_from("<I", d, pe + 24 + 56)[0]  # OptionalHeader.SizeOfImage
+    return stamp == mod.timestamp and size == mod.size
 
 
 def module_for(mods, addr):
@@ -57,9 +74,15 @@ def main(path):
         name = module_for(mods, v)
         if name and not name.startswith(("ntdll", "KERNEL")):
             hits.append(name)
+    syms = pdb_symbols.Symbols() if local_build_matches(mods) else None
+    if syms is None or not syms.ok:
+        print("(version.dll refs unsymbolized: dump is not from the local build or no PDB)")
     print("stack refs:")
     for h in hits[:60]:
-        print("  ", h)
+        label = ""
+        if syms is not None and syms.ok and h.startswith("version.dll+0x"):
+            label = f"  {syms.name(int(h.split('+0x')[1], 16)) or ''}"
+        print("  ", h + label)
 
 
 if __name__ == "__main__":

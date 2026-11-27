@@ -13,6 +13,10 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 option(PZ2COOP_DEV_DIAG "Install verbose file/debug diagnostic IAT hooks and memory marker scanner" OFF)
 add_compile_options(/W4 /WX /permissive- /utf-8)
+# Release PDB (stays in build/, never shipped) so crash dumps map to source lines (tools/crashdump_info.py).
+# /DEBUG would turn off /OPT:REF,ICF, so they are set explicitly to keep the shipped code unchanged.
+add_compile_options($<$<CONFIG:Release>:/Zi>)
+add_link_options($<$<CONFIG:Release>:/DEBUG> $<$<CONFIG:Release>:/OPT:REF> $<$<CONFIG:Release>:/OPT:ICF>)
 add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 if(PZ2COOP_DEV_DIAG)
     add_compile_definitions(PZ2COOP_DEV_DIAG=1)

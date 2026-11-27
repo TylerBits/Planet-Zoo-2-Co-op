@@ -96,6 +96,7 @@ def main() -> int:
         ("two-peer E2E wire", [py, "tools/test_two_peer_e2e.py"]),
         ("ui JS headless", [shutil.which("node"), "tools/test_ui_js.mjs"] if shutil.which("node") else None),
         ("verify gate + live stamp", [py, "tools/test_verify_gate.py"]),
+        ("crash dump symbols", [py, "tools/test_pdb_symbols.py"]),
         ("release invariants", check_invariants),
     ]
 
