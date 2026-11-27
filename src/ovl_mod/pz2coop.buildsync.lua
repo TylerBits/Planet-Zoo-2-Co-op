@@ -25,6 +25,8 @@ local global = _G
 local api = global.api
 local string = global.string
 local table = global.table
+local error = global.error
+local select = global.select
 local math = global.math
 local pairs = global.pairs
 local ipairs = global.ipairs
@@ -53,6 +55,7 @@ local c_nDeleteSpatial = 0x21
 -- radius instead of the spec's 5 cm until real drift is measured in-game.
 local c_nSearchRadiusMm = 250
 local c_nUndoRedoSettle = 0.5
+local c_nAfterLocalCommit = 1.0 -- seconds a remote editor change waits after the player's own commit
 -- Blueprint files are kept for undo (a deleted building is rebuilt from its last saved state), so slots are
 -- recycled late. ponytail: undo of a building whose slot was reused restores the wrong blueprint.
 local c_nClipSlots = 512
@@ -298,21 +301,53 @@ local NotePrePart = function(_nPartID)
   end
 end
 
--- Vanilla passes a part ID, a table of part IDs, or a part set (only GetOnePartID is known on it).
--- ponytail: a multi-object part set yields one object's pre-image; others are caught via tSeen.
+-- Vanilla passes a part ID, a table of part IDs, or a BuildingPartSet (table or userdata, Demolish / Multi-Select).
+-- Read every part ID via GetPartIDCollection() so batch demolishes capture all parts, not just 1 of N.
 local NotePre = function(_arg)
-  if Bridge.IsApplying() or s.rawUndo == nil then
+  if Bridge.IsApplying() or s.rawUndo == nil or _arg == nil then
     return
   end
   if type(_arg) == "number" then
     NotePrePart(_arg)
-  elseif type(_arg) == "table" then
+    return
+  end
+  local bGotCollection = false
+  local bOkCol, tCol = pcall(function()
+    return _arg.GetPartIDCollection and _arg:GetPartIDCollection()
+  end)
+  if bOkCol and type(tCol) == "table" then
+    for _, v in pairs(tCol) do
+      if type(v) == "number" then
+        NotePrePart(v)
+        bGotCollection = true
+      end
+    end
+  end
+  if not bGotCollection then
+    local bOkP, tP = pcall(function()
+      return _arg.GetPartIDCollectionWithPuppetIndices and _arg:GetPartIDCollectionWithPuppetIndices()
+    end)
+    if bOkP and type(tP) == "table" then
+      for _, v in pairs(tP) do
+        if type(v) == "table" and type(v.nID) == "number" then
+          NotePrePart(v.nID)
+          bGotCollection = true
+        end
+      end
+    end
+  end
+  if not bGotCollection and type(_arg) == "table" then
     for _, v in pairs(_arg) do
       if type(v) == "number" then
         NotePrePart(v)
+        bGotCollection = true
+      elseif type(v) == "table" and type(v.nID) == "number" then
+        NotePrePart(v.nID)
+        bGotCollection = true
       end
     end
-  elseif _arg ~= nil then
+  end
+  if not bGotCollection then
     local bOk, nPartID = pcall(function()
       return _arg:GetOnePartID()
     end)
@@ -406,7 +441,16 @@ local IsUndoFree = function()
   local undo = s.rawUndo
   local bOk, bPreviewing = pcall(undo.IsPreviewingChangeList)
   local bOk2, bBusy = pcall(undo.IsBusy)
-  return not (bOk and bPreviewing) and not (bOk2 and bBusy)
+  if (bOk and bPreviewing) or (bOk2 and bBusy) then
+    return false
+  end
+  if s.fnExternalBusy ~= nil then
+    local bExtOk, bExtBusy = pcall(s.fnExternalBusy)
+    if bExtOk and bExtBusy == true then
+      return false
+    end
+  end
+  return true
 end
 
 -- Waits on undo-system tokens with the raw API so replays never look like local commits. Remote jobs only.
@@ -512,15 +556,16 @@ local Job_SendPlace = function(_obj, _tKey, _op)
   Bridge.SendPacket(c_nPlaceObject, sFile, {x = _tKey.x, y = _tKey.y, z = _tKey.z})
 end
 
--- h carries the sender's group ID as a lookup hint; the receiver only trusts it if its own group with
+-- h carries the sender's group/part ID as a lookup hint; the receiver only trusts it if its own object with
 -- that ID sits at the sent position (NETWORK_PROTOCOL.md, ACTION_DELETE_SPATIAL). Parts carry their
 -- resource name instead (k = "p", n = name).
 local SendDelete = function(_tKey, _obj)
   local tNet = s.tNetKey[_obj]
   local tPos = tNet or _tKey
   local bPart = IsPart(_obj)
+  local nHint = bPart and (PartIDOf(_obj) or 0) or _obj
   Count(bPart and "sent part delete" or "sent group delete")
-  Bridge.SendPacket(c_nDeleteSpatial, nil, {h = bPart and 0 or _obj, x = tPos.x, y = tPos.y, z = tPos.z,
+  Bridge.SendPacket(c_nDeleteSpatial, nil, {h = nHint, x = tPos.x, y = tPos.y, z = tPos.z,
     r = c_nSearchRadiusMm, p = tNet and 1 or nil, k = bPart and "p" or nil, n = bPart and _tKey.sName or nil})
 end
 
@@ -555,6 +600,8 @@ local Emit = function(_sWhat, _obj, _tKey, _bSending)
   return true
 end
 
+local Job_ApplyPlace, Job_ApplyDelete, QueueRemote -- defined below; used by the landing-offset correction
+
 local ProcessSettled = function(_bSending)
   if s.fnSettleListener ~= nil then
     s.fnSettleListener()
@@ -571,10 +618,23 @@ local ProcessSettled = function(_bSending)
       s.tNetKey[obj] = s.tPendingNetKey
       local sOff = ""
       if tKey ~= nil and s.tPendingNetKey ~= nil then
-        sOff = string.format(", landed %d cm from target",
-          Cm(DistCm(tKey, s.tPendingNetKey.x, s.tPendingNetKey.y, s.tPendingNetKey.z) / 100))
+        s.nLastLandedCm = Cm(DistCm(tKey, s.tPendingNetKey.x, s.tPendingNetKey.y, s.tPendingNetKey.z) / 100)
+        sOff = string.format(", landed %d cm from target", s.nLastLandedCm)
       end
       Bridge.Log("build sync: " .. Label(obj, tKey) .. " came from the remote player, not sent back" .. sOff)
+      -- The open-editor route has no drift check: an aquarium landed 154 cm off (autotest 2026-11-27). The
+      -- offset is fixed per blueprint, so delete it and re-place once with the offset subtracted.
+      local tPend = s.tPendingNetKey
+      if not IsPart(obj) and tKey ~= nil and tPend ~= nil and tPend.sFile ~= nil and not tPend.bCorrected and
+          DistCm(tKey, tPend.x, tPend.y, tPend.z) > c_nDriftToleranceCm then
+        local tFix = {x = 2 * tPend.x - tKey.x, y = 2 * tPend.y - tKey.y, z = 2 * tPend.z - tKey.z,
+          tNet = {x = tPend.x, y = tPend.y, z = tPend.z, bCorrected = true}}
+        Bridge.Log("build sync: re-placing " .. Label(obj, tKey) .. " once with its landing offset corrected")
+        local tDel = {h = obj, x = tKey.x, y = tKey.y, z = tKey.z, r = c_nSearchRadiusMm}
+        QueueRemote(function() Job_ApplyDelete(tDel) end, false, true)
+        local sFile = tPend.sFile
+        QueueRemote(function() Job_ApplyPlace(sFile, tFix) end, true, true)
+      end
       -- Keep the partner's building as a blueprint too, so deleting it here can be undone.
       if not IsPart(obj) and tKey ~= nil then
         table.insert(s.tJobs, {fn = function() BuildSync.SnapshotGroup(obj) end})
@@ -688,6 +748,7 @@ local MakeDriftAdjust = function(_moveObject, _tData)
       Bridge.Log("build sync: drift check skipped (previewed groups have no AABB yet)")
       return
     end
+    s.tLastGroupBox = {y0 = nMinY, y1 = nMaxY} -- cm, autotest only (BuildSync.TakeLastGroupBox)
     local dx = _tData.x - (nMinX + nMaxX) / 2
     local dy = _tData.y - (nMinY + nMaxY) / 2
     local dz = _tData.z - (nMinZ + nMaxZ) / 2
@@ -696,17 +757,80 @@ local MakeDriftAdjust = function(_moveObject, _tData)
       Bridge.Log(string.format("build sync: drift %d cm before commit, no correction needed", Cm(nOff / 100)))
       return
     end
-    local vPos = Vector3:new((_tData.x + dx) / 100, (_tData.y + dy) / 100, (_tData.z + dz) / 100)
+    local vPos
+    local bGotPos, vCur = pcall(function() return _moveObject:GetPosition() end)
+    if bGotPos and vCur ~= nil then
+      vPos = Vector3:new(vCur:GetX() + dx / 100, vCur:GetY() + dy / 100, vCur:GetZ() + dz / 100)
+    else
+      vPos = Vector3:new((_tData.x + dx) / 100, (_tData.y + dy) / 100, (_tData.z + dz) / 100)
+    end
     _moveObject:SetTransform(TransformQ.Identity:WithPos(vPos), {})
     Bridge.Log(string.format("build sync: drift %d cm before commit, corrected", Cm(nOff / 100)))
   end
 end
 
+local PrepareBuildHierarchy = function(_hierarchy)
+  pcall(function()
+    if _hierarchy.SetPerformTerrainModificationsModifyVolumes ~= nil then
+      _hierarchy:SetPerformTerrainModificationsModifyVolumes(false)
+    end
+    local gt = api.world.GetWorldAPIs().gameterrain
+    local op = _hierarchy.GetTerrainEditOperation and _hierarchy:GetTerrainEditOperation() or nil
+    if gt ~= nil and op ~= nil and gt.SetTerrainEditOpCollisionFlags ~= nil then
+      gt:SetTerrainEditOpCollisionFlags(op, true, false, false, true, true, gt.CheckLakesMode_Off or 0, false)
+    end
+  end)
+end
+
+-- Vanilla blueprint commit check, exactly (SingleFeatureUndoablePlacementModeBase._OnTryCommitCheck +
+-- BlueprintPlacementMode.OnTryCommitCheck): terrain edits on, and the move object flattens/joins the ground
+-- unless its toggle is locked to never flatten. Without it a friend's aquarium or floor ignores the terrain.
+local VanillaPlacementCommitStep = function(_hierarchy, _moveObject)
+  local tResult = {}
+  local Step = function(_sName, _fn)
+    local bOk, sErr = pcall(_fn)
+    table.insert(tResult, _sName .. "=" .. (bOk and "ok" or ("ERR " .. tostring(sErr))))
+  end
+  Step("begin", function() _hierarchy:BeginVolumeModificationsBlock() end)
+  Step("terrain", function() _hierarchy:SetPerformTerrainModificationsModifyVolumes(true) end)
+  if _moveObject ~= nil then
+    Step("flatten", function()
+      local editors = api.world.GetWorldAPIs().editors
+      local nToggle = _moveObject:GetFlattenTerrainToggleState()
+      local bFlatten = nToggle ~= editors.FlattenTerrain_LockedNeverFlatten
+      editors:SetTerrainActionOnMoveObject(_moveObject,
+        bFlatten and editors.TerrainActionType_PathJoinPartFlatten or editors.TerrainActionType_None, true)
+      table.insert(tResult, "toggle=" .. tostring(nToggle) .. " flatten=" .. tostring(bFlatten))
+      if not s.bLoggedTerrainConsts then
+        s.bLoggedTerrainConsts = true
+        local tConsts = {}
+        pcall(function()
+          for k, v in pairs(editors) do
+            if type(k) == "string" and (k:find("TerrainAction", 1, true) or k:find("FlattenTerrain", 1, true)) then
+              table.insert(tConsts, k .. "=" .. tostring(v))
+            end
+          end
+        end)
+        table.sort(tConsts)
+        Bridge.Log("build sync: terrain consts " .. table.concat(tConsts, " "))
+      end
+    end)
+  else
+    table.insert(tResult, "flatten=skipped(no move object)")
+  end
+  Step("end", function() _hierarchy:EndVolumeModificationsBlock() end)
+  if (s.nCommitStepLogs or 0) < 20 then
+    s.nCommitStepLogs = (s.nCommitStepLogs or 0) + 1
+    Bridge.Log("build sync: commit-check step " .. table.concat(tResult, " "))
+  end
+end
+
 local Yielding_ApplyChange -- defined after Yielding_ModeOperation
 
-local Job_ApplyPlace = function(_sFile, _tData)
+Job_ApplyPlace = function(_sFile, _tData)
   NoteRemote(_tData.x, _tData.y, _tData.z)
   local bCommitted, bViaEditor = Yielding_ApplyChange("group", _tData, function(hierarchy)
+    PrepareBuildHierarchy(hierarchy)
     Breadcrumb("load " .. tostring(_sFile))
     local bOk, sError = ParkLoadSaveManager():LoadBlueprintFromFile(_sFile)
     if not bOk then
@@ -725,9 +849,14 @@ local Job_ApplyPlace = function(_sFile, _tData)
     -- ponytail: position only; rotation rides inside the blueprint. Verify orientation in-game.
     local vPos = Vector3:new(_tData.x / 100, _tData.y / 100, _tData.z / 100)
     moveObject:SetTransform(TransformQ.Identity:WithPos(vPos), {})
-    s.tPendingNetKey = {x = _tData.x, y = _tData.y, z = _tData.z}
+    -- tNet: a corrected re-place keeps the original target as the position the partner knows it by.
+    s.tPendingNetKey = _tData.tNet or {x = _tData.x, y = _tData.y, z = _tData.z, sFile = _sFile}
     Breadcrumb("preview, drift check, commit")
-    return true, MakeDriftAdjust(moveObject, _tData)
+    local fnDrift = MakeDriftAdjust(moveObject, _tData)
+    return true, function()
+      fnDrift()
+      VanillaPlacementCommitStep(hierarchy, moveObject)
+    end, moveObject
   end)
   if bCommitted == nil or bViaEditor then
     return -- retry later, or the editor route already counted and logged it
@@ -755,16 +884,61 @@ local GetEditMode = function()
   return nil
 end
 
+-- Temporarily suspends Career Mode tutorial placement restrictions (editors:GetIsTutorialActive /
+-- SetIsTutorialActive) while applying a remote peer's action so valid builds/deletes/fences from a friend
+-- are never rejected with bTutorialPlacementInvalid when peers are on slightly different tutorial steps.
+local SuspendTutorialRestriction = function()
+  local bWas = false
+  pcall(function()
+    local ed = api.world.GetWorldAPIs().editors
+    if ed ~= nil and ed.GetIsTutorialActive ~= nil and ed.SetIsTutorialActive ~= nil then
+      if ed:GetIsTutorialActive() == true then
+        ed:SetIsTutorialActive(false)
+        bWas = true
+      end
+    end
+  end)
+  if bWas then
+    s.nTutorialSuspended = (s.nTutorialSuspended or 0) + 1
+  end
+  return bWas
+end
+
+local RestoreTutorialRestriction = function(_bWas)
+  if not _bWas then
+    return
+  end
+  s.nTutorialSuspended = math.max(0, (s.nTutorialSuspended or 1) - 1)
+  if s.nTutorialSuspended == 0 then
+    pcall(function()
+      local ed = api.world.GetWorldAPIs().editors
+      if ed ~= nil and ed.SetIsTutorialActive ~= nil then
+        ed:SetIsTutorialActive(true)
+      end
+    end)
+  end
+end
+
 -- Hands _fnChange to the active editor, waiting until one exists and is idle; then waits for the commit
--- (or c_nModeOpTimeout seconds: a refused commit never calls fnPostWait).
+-- (or exits promptly if the editor finishes without calling postWait because the commit was refused).
 local Yielding_ModeOperation = function(_sWhat, _tData, _fnChange)
   local nStart = s.nClock
   local bLoggedWait = false
   while true do
     local mode = GetEditMode()
-    if mode ~= nil and not mode:HasRequestedChange() then
-      local tState = {bDone = false}
+    -- Not while the engine is still finishing a commit: a remote part handed over right after a 697-part
+    -- aquarium commit (water still filling) crashed at PlanetZoo2.exe+0x6e75372 (2026-11-27 12:45).
+    local bBusy = select(2, pcall(s.rawUndo.IsBusy)) == true or
+      s.nClock - (s.nLastLocalCommit or -1e9) < c_nAfterLocalCommit
+    if mode ~= nil and not bBusy and not mode:HasRequestedChange() then
+      local tState = {bDone = false, bRan = false, bAppliedGuard = false, bTutSuspended = false}
       local bQueued = mode:RequestUndoOperation(function(clh)
+        tState.bRan = true
+        tState.bTutSuspended = SuspendTutorialRestriction()
+        if not Bridge.IsApplying() then
+          Bridge.BeginApply()
+          tState.bAppliedGuard = true
+        end
         -- Recorded when the change actually runs, so the echo window covers the commit that follows.
         NoteRemote(_tData.x, _tData.y, _tData.z)
         _fnChange(clh)
@@ -772,16 +946,44 @@ local Yielding_ModeOperation = function(_sWhat, _tData, _fnChange)
         NoteRemote(_tData.x, _tData.y, _tData.z)
         s.rawUndo.ClearHistory({})
         tState.bDone = true
+        if tState.bAppliedGuard then
+          tState.bAppliedGuard = false
+          Bridge.EndApply()
+        end
+        if tState.bTutSuspended then
+          tState.bTutSuspended = false
+          RestoreTutorialRestriction(true)
+        end
+        s.nRemoteGraceUntil = s.nClock + c_nRemoteGrace
       end)
       if bQueued then
         Bridge.Log("build sync: " .. _sWhat .. " handed to the active editor")
         local nQueued = s.nClock
+        local nIdleAfterRun = 0
         while not tState.bDone and s.nClock - nQueued < c_nModeOpTimeout do
+          if tState.bRan and not mode:HasRequestedChange() then
+            nIdleAfterRun = nIdleAfterRun + 1
+            if nIdleAfterRun >= 2 then
+              break -- editor completed the coroutine without calling postWait (commit refused)
+            end
+          end
           coroutine.yield()
         end
+        if tState.bAppliedGuard then
+          tState.bAppliedGuard = false
+          Bridge.EndApply()
+        end
+        if tState.bTutSuspended then
+          tState.bTutSuspended = false
+          RestoreTutorialRestriction(true)
+        end
+        s.nRemoteGraceUntil = s.nClock + c_nRemoteGrace
         if tState.bDone then
           Count("applied " .. _sWhat)
           Bridge.Log("build sync: remote " .. _sWhat .. " applied, undo history cleared")
+        elseif tState.bRan and nIdleAfterRun >= 2 then
+          Count("apply failed")
+          Bridge.Log("build sync: remote " .. _sWhat .. " refused by the active editor")
         else
           Count("apply failed")
           Bridge.Log("build sync: remote " .. _sWhat .. " not committed by the editor within " .. c_nModeOpTimeout .. " s")
@@ -810,7 +1012,8 @@ end
 -- waited until you put the item down (88 s in the 2026-11-25 test).
 -- Returns committed (true/false) and whether the editor ran it; nil = try again later (s.bRetry set).
 Yielding_ApplyChange = function(_sWhat, _tData, _fnBuild)
-  if IsUndoFree() then
+  -- PZ2COOP_FORCE_EDITOR (autotest only): take the editor route without a live player preview.
+  if IsUndoFree() and global.rawget(global, "PZ2COOP_FORCE_EDITOR") ~= true then
     local hierarchy = api.world.GetWorldAPIs().editors:CreateUndoOperationsHierarchy()
     local bBuilt, fnAdjust = _fnBuild(hierarchy)
     if not bBuilt then
@@ -820,7 +1023,12 @@ Yielding_ApplyChange = function(_sWhat, _tData, _fnBuild)
   end
   local bBuilt = false
   local bDone = Yielding_ModeOperation(_sWhat, _tData, function(clh)
-    bBuilt = _fnBuild(clh) == true
+    local bOk, fnAdjust, moveObject = _fnBuild(clh)
+    bBuilt = bOk == true
+    if bBuilt and fnAdjust ~= nil then
+      -- No preview step here (the editor previews and commits itself): do the commit-check step now.
+      VanillaPlacementCommitStep(clh, moveObject)
+    end
   end)
   if bDone == nil then
     s.bRetry = true
@@ -840,8 +1048,81 @@ local Job_ApplyPlacePart = function(_tData)
   end)
 end
 
--- Candidates: the sender's ID hint (same save on both sides keeps loaded IDs equal) plus every object of
--- the same kind this client has seen; the spatial key (and, for parts, the resource name) decides.
+-- Discovers pre-existing scenery parts or building groups near (_xCm, _yCm, _zCm) via spatial:SphereQuery
+-- (same flag set + parent walk as editors.demolish.demolisheditmode.lua:888-960) so deleting objects that
+-- were loaded from the baseline save (and thus absent from s.tSeen) works reliably across peers.
+local AddSpatialCandidates = function(_tCandidates, _bPart, _xCm, _yCm, _zCm, _nRadiusCm)
+  local tWorld = api.world.GetWorldAPIs()
+  local spatial = tWorld.spatial
+  local puppets = tWorld.scenery_puppets
+  if spatial == nil or spatial.SphereQuery == nil or puppets == nil or puppets.EntityIDToPlacementID == nil then
+    return
+  end
+  local nFlags = 0
+  for _, sFlag in ipairs({
+    "Flag_Scenery", "Flag_NonStaticScenery", "Flag_BulldozeNature", "Flag_Facility", "Flag_Exhibit",
+    "Flag_PathExtra", "Flag_Enrichment", "Flag_StaticEnrichment", "Flag_Bedding", "Flag_BulldozeHabitatObjects",
+  }) do
+    local nBit = spatial[sFlag]
+    if type(nBit) == "number" then
+      nFlags = nFlags | nBit
+    end
+  end
+  if nFlags == 0 then
+    return
+  end
+  local nRadiusM = math.max((_nRadiusCm or 25) / 100 + 1.5, 2.5)
+  local vPos = Vector3:new(_xCm / 100, _yCm / 100, _zCm / 100)
+  local bOk, tHits = pcall(spatial.SphereQuery, spatial, vPos, nRadiusM, nFlags, 0, 128)
+  if not bOk or type(tHits) ~= "table" then
+    return
+  end
+  local pih = tWorld.PlayerInteractionHandler
+  local tr = tWorld.transform
+  local tChecked = {}
+  local TryEntity = function(_nEntityID)
+    if _nEntityID == nil or tChecked[_nEntityID] then
+      return
+    end
+    tChecked[_nEntityID] = true
+    local bP, nPartID = pcall(puppets.EntityIDToPlacementID, puppets, _nEntityID)
+    if bP and type(nPartID) == "number" then
+      if _bPart then
+        _tCandidates["p" .. nPartID] = true
+      else
+        local nGroupID = GroupOf(nPartID)
+        if nGroupID ~= nil then
+          _tCandidates[nGroupID] = true
+        end
+      end
+    end
+  end
+  for _, nHit in ipairs(tHits) do
+    TryEntity(nHit)
+    local nCur = nHit
+    for _ = 1, 4 do
+      if nCur == nil then
+        break
+      end
+      local nNext = nil
+      pcall(function()
+        if pih ~= nil and pih.HasParentEntityID ~= nil and pih:HasParentEntityID(nCur) then
+          nNext = pih:GetParentID(nCur)
+        elseif tr ~= nil and tr.GetParent ~= nil then
+          nNext = tr:GetParent(nCur)
+        end
+      end)
+      if nNext == nil or nNext == nCur then
+        break
+      end
+      TryEntity(nNext)
+      nCur = nNext
+    end
+  end
+end
+
+-- Candidates: objects seen this session + sender's ID hint + spatial query for pre-existing save objects;
+-- the spatial key (and, for parts, the resource name) always decides (CLAUDE.md rule 3).
 local FindNear = function(_tData)
   local bPart = _tData.k == "p"
   local nRadiusCm = (_tData.r or c_nSearchRadiusMm) / 10
@@ -851,24 +1132,32 @@ local FindNear = function(_tData)
       tCandidates[obj] = true
     end
   end
-  if not bPart and type(_tData.h) == "number" and _tData.h > 0 then
-    tCandidates[_tData.h] = true
+  if type(_tData.h) == "number" and _tData.h > 0 then
+    tCandidates[bPart and ("p" .. _tData.h) or _tData.h] = true
   end
-  local bestObj, nBestDist = nil, nil
-  for obj in pairs(tCandidates) do
-    local tKey = KeyOf(obj)
-    if tKey ~= nil and (not bPart or tKey.sName == _tData.n) then
-      local tMatch = s.tNetKey[obj] or tKey
-      local nDist = DistCm(tMatch, _tData.x, _tData.y, _tData.z)
-      if nDist <= nRadiusCm and (nBestDist == nil or nDist < nBestDist) then
-        bestObj, nBestDist = obj, nDist
+  local SearchCandidates = function()
+    local bestObj, nBestDist = nil, nil
+    for obj in pairs(tCandidates) do
+      local tKey = KeyOf(obj)
+      if tKey ~= nil and (not bPart or tKey.sName == _tData.n) then
+        local tMatch = s.tNetKey[obj] or tKey
+        local nDist = DistCm(tMatch, _tData.x, _tData.y, _tData.z)
+        if nDist <= nRadiusCm and (nBestDist == nil or nDist < nBestDist) then
+          bestObj, nBestDist = obj, nDist
+        end
       end
     end
+    return bestObj
+  end
+  local bestObj = SearchCandidates()
+  if bestObj == nil then
+    AddSpatialCandidates(tCandidates, bPart, _tData.x, _tData.y, _tData.z, nRadiusCm)
+    bestObj = SearchCandidates()
   end
   return bestObj
 end
 
-local Job_ApplyDelete = function(_tData)
+Job_ApplyDelete = function(_tData)
   NoteRemote(_tData.x, _tData.y, _tData.z)
   local obj = FindNear(_tData)
   if obj == nil then
@@ -974,15 +1263,17 @@ local NextRunnableJob = function()
   return nil
 end
 
--- Wraps a remote job in the apply guard (CLAUDE.md rule 2) and re-queues it at the front when its commit
--- found the undo system taken.
-local QueueRemote = function(_fnJob, _bSlot, _bEditorOk)
+-- Wraps a remote job in the apply guard (CLAUDE.md rule 2) + temporary Career tutorial restriction suspend,
+-- and re-queues it at the front when its commit found the undo system taken.
+QueueRemote = function(_fnJob, _bSlot, _bEditorOk)
   local tJob = {bSlot = _bSlot, bPreview = true, bEditorOk = _bEditorOk == true}
   tJob.fn = function()
+    local bTutSuspended = SuspendTutorialRestriction()
     Bridge.BeginApply()
     s.bRetry = false
     _fnJob()
     Bridge.EndApply()
+    RestoreTutorialRestriction(bTutSuspended)
     s.nRemoteGraceUntil = s.nClock + c_nRemoteGrace
     if s.bRetry then
       s.bRetry = false
@@ -1127,6 +1418,18 @@ local HookUndoKeys = function()
     return
   end
   rawset(MainHUD, "__PZ2CoopUndoHook", true)
+  local fnUpdateDisplay = rawget(MainHUD, "UpdateDisplay")
+  if type(fnUpdateDisplay) == "function" then
+    rawset(MainHUD, "UpdateDisplay", function(...)
+      s.bHudQuery = Bridge.GetRole() ~= "none"
+      local tResults = table.pack(pcall(fnUpdateDisplay, ...))
+      s.bHudQuery = false
+      if not tResults[1] then
+        error(tResults[2], 0)
+      end
+      return table.unpack(tResults, 2, tResults.n)
+    end)
+  end
   rawset(MainHUD, "RequestUndoRedo", function(self, _bUndo, ...)
     if Bridge.GetRole() ~= "none" and s.rawUndo ~= nil then
       local bOkHandle, bHandled = pcall(BuildSync.HandleUndoRedo, _bUndo == true)
@@ -1294,6 +1597,20 @@ BuildSync.Install = function(_fnOnLocalChange)
       s.nUndoRedoTimer = c_nUndoRedoSettle
       return raw.Redo(...)
     end,
+    -- Only while the HUD draws (s.bHudQuery): remote applies clear the game's history, and a disabled HUD
+    -- undo button also blocks Ctrl+Z, so our own per-player journal would never be reached.
+    CanUndo = function(...)
+      if s.bHudQuery and #s.tUndo > 0 then
+        return true
+      end
+      return raw.CanUndo(...)
+    end,
+    CanRedo = function(...)
+      if s.bHudQuery and #s.tRedo > 0 then
+        return true
+      end
+      return raw.CanRedo(...)
+    end,
   }, {__index = raw})
   api.undo = s.tProxy
   HookHierarchy()
@@ -1310,6 +1627,7 @@ BuildSync.Install = function(_fnOnLocalChange)
           table.insert(s.tRemoteTouched, tMessage.nPlacementPartID)
         else
           table.insert(s.tTouched, tMessage.nPlacementPartID)
+          s.nLastLocalCommit = s.nClock
         end
       end
     end
@@ -1346,6 +1664,10 @@ BuildSync.Uninstall = function()
   if Bridge.IsApplying() then
     Bridge.EndApply()
   end
+  if (s.nTutorialSuspended or 0) > 0 then
+    s.nTutorialSuspended = 1
+    RestoreTutorialRestriction(true)
+  end
   s.rawUndo = nil
   s.tProxy = nil
   s.worker = nil
@@ -1358,6 +1680,22 @@ BuildSync.QueueJob = function(_fn)
 end
 BuildSync.QueueRemote = QueueRemote
 BuildSync.Yielding_ModeOperation = Yielding_ModeOperation
+BuildSync.TakeLastLandedCm = function() -- autotest: distance of the last remote group from its target
+  local n = s.nLastLandedCm
+  s.nLastLandedCm = nil
+  return n
+end
+BuildSync.TakeLastGroupBox = function()
+  local t = s.tLastGroupBox
+  s.tLastGroupBox = nil
+  return t
+end
+BuildSync.VanillaPlacementCommitStep = function(...)
+  return VanillaPlacementCommitStep(...)
+end
+BuildSync.Yielding_ApplyChange = function(...)
+  return Yielding_ApplyChange(...)
+end
 BuildSync.Breadcrumb = Breadcrumb
 BuildSync.NextClipFile = NextClipFile
 BuildSync.IsUndoFree = IsUndoFree
@@ -1370,6 +1708,9 @@ BuildSync.GetTool = function()
 end
 BuildSync.SetSettleListener = function(_fn)
   s.fnSettleListener = _fn
+end
+BuildSync.SetExternalBusyCheck = function(_fn)
+  s.fnExternalBusy = _fn
 end
 
 -- One heartbeat line: what was seen, sent, applied and failed, plus the habitat count (proves the
@@ -1429,6 +1770,10 @@ BuildSync.Update = function(_nDeltaTime, _bSending)
       Bridge.Log("build sync: job failed: " .. tostring(sError))
       if Bridge.IsApplying() then
         Bridge.EndApply()
+      end
+      if (s.nTutorialSuspended or 0) > 0 then
+        s.nTutorialSuspended = 1
+        RestoreTutorialRestriction(true)
       end
       s.worker = nil
     elseif coroutine.status(s.worker) == "dead" then

@@ -12,9 +12,9 @@ Every name below was harvested from the decompiled game scripts, not guessed. Pa
 | Decompiler | cobra-tools' bundled `luadec.exe -s` (stock unluac not tested; luadec without `-s` segfaults) |
 | Coverage | 1091 / 1116 decompiled. 25 failures, all `peep*` guest-appearance modules (irrelevant to sync) |
 | Quality | ~630 files contain partial `DECOMPILER ERROR` blocks. Names, strings, call sites are reliable; control flow is not |
-| UI layer | `GameMain/Content/UserInterfaceEssentials.ovl` holds a single `.ppuipkg`. **No HTML/JS has been extracted** (cobra-tools has no loader for it) |
+| UI layer | `GameMain/Content/UserInterfaceEssentials.ovl` holds a single `.ppuipkg` (patched locally via `tools/ui_overlay.py` & `src/proxy_dll/ui_overlay.cpp`) |
 
-Regenerate: `python tools/extract_all_lua.py` (all steps) or `--skip-extract` (decompile only).
+**Extraction pipeline (`tools/extract_all_lua.py`):** auto-detects `<Steam>\steamapps\common\Planet Zoo 2\Win64\ovldata` (override with `--game-dir`), unpacks `.ovl` script archives via `cobra-tools` into `decompiled_lua/raw/`, and decompiles Frontier Lua 5.3 bytecode (`\x1bLua`) via `luadec.exe -s` into `decompiled_lua/vanilla/` (gitignored; never commit extracted files). Run `python tools/extract_all_lua.py` (or `--skip-extract` to re-decompile only).
 
 "Verified" = seen at a real call site. "Unverified" = name/shape known, runtime behaviour not yet observed in-game.
 
@@ -199,7 +199,6 @@ Group helpers: `tWorldAPIs.scenery_group:TryGetBuildingGroupForPart`, `GetGroupM
 - Single-part delete: `NonYielding_AddPartToDestroyIntoCompositeObject(clh, composite, partID)` +
   `Yielding_DestroyCompositeContents(tWorldAPIs, clh, composite)` (components.ui.exhibitinfopopup.lua:1818).
 - Tool changes: `BaseEditMode.SetNewMode` / `BaseUIMode.SetNewMode` (looked up on every call by vanilla).
-Retail status of everything in 5.1 except the group call: unverified until the mega test (docs/MEGA_TEST.md).
 
 ### 5.2 Paths and fences in an area (decompiled 2026-11-12; used by pz2coop.regionsync.lua, retail unverified)
 - World-space queries: `tWorldAPIs.spatial:CylinderQuery(vBottom, vTop, radius, flags, 0, maxCount)`,
@@ -271,7 +270,7 @@ code → **inspect at runtime**). Sync-relevant types:
 `MsgType_ExhibitAnimalRemovedMessage`, `MsgType_AnimalAssignedHabitatChangedMessage`,
 `MsgType_PlayerBlueprintSavedDeletedMessage`, `MsgType_PlayerParkSavedDeletedMessage`, `MsgType_ParkTimeRegularMessage`.
 
-## 10a. Verified in the retail game (2026-11-06, version.dll diag.log)
+## 10. Verified retail findings & Lua ⇄ DLL bridge (version.dll diag.log)
 
 | Finding | Evidence |
 | :--- | :--- |
@@ -288,26 +287,7 @@ code → **inspect at runtime**). Sync-relevant types:
 | Game re-runs module files during boot (package cache resets): per-module state must live in `_G` | overlay load / hook install logged ~40× in the first second |
 | Frontier Lua TValue is **24 bytes** (stock 5.3: 16); integers, `//`, `%`, wrap-around multiply behave as stock 5.3 | mem bridge discovery + codec self-test |
 
-**Working transport:** a Lua integer table used as shared memory (`src/proxy_dll/mem_bridge.hpp`,
-`src/ovl_mod/pz2coop.bridge.lua`). Lua→DLL logging lands in `<game>/PZ2Coop/diag.log` as `lua: ...`.
-
-## 10. Lua ⇄ outside world (IPC bridge) — original analysis (superseded by 10a)
-
-| Channel | Status |
-| :--- | :--- |
-| `api.debug.WriteStringToFile(sData, sPath)` / `api.debug.ReadStringFromFile(sPath)` | **Available** (10 / 3 call sites incl. non-debug `editors.track.trackeditselection`). Retail behaviour unverified |
-| `api.debug.GetFilesOfType`, `api.debug.GetMostRecentlyModifiedFile` | available |
-| `api.json.Stringify(t[, bPretty])` → `(bOK, sJson)`, `api.json.Parse(s)`, `api.json.GetArrayMetatable()` | available |
-| UI (Gameface) events: `api.ui2.RequestTriggerEvent`, `TriggerEventAtNextAdvance`, `RegisterForEvent`, `RequestRegisterForEvent(Global)` (`GameMain/Main/ui2.viewwrapper.lua`) | available, but the JS side lives in the unextracted `.ppuipkg` |
-
-The WebSocket bridge (ARCHITECTURE.md §2.1) needs JS running inside the Gameface view. **No route to inject JS
-has been found yet** (`.ppuipkg` cannot be unpacked by cobra-tools). The file bridge (§2.2) is the only path confirmed
-by the decompiled code and is what `src/ovl_mod` uses: `version.dll` serves it from `<game exe dir>/PZ2Coop/`
-(protocol in `src/proxy_dll/file_bridge.hpp`). Session control is via DLL hotkeys (Ctrl+Shift+H/J/L) until a UI exists.
-
-Unverified until the first in-game run: which virtual prefix `api.debug` file paths resolve against (the Lua side
-probes several for the DLL's `bridge.txt` beacon), and whether `SaveParkToFile` / `LoadBlueprintFromFile` use the
-same root.
+**Working transport:** a Lua integer table used as shared memory (`src/proxy_dll/mem_bridge.hpp`, `src/ovl_mod/pz2coop.bridge.lua`). Lua→DLL logging lands in `<game>/PZ2Coop/diag.log` as `lua: ...`. Useful JSON/UI helpers: `api.json.Stringify(t[, bPretty])` → `(bOK, sJson)`, `api.json.Parse(s)`, `api.json.GetArrayMetatable()`, and `api.ui2.RequestTriggerEvent / TriggerEventAtNextAdvance / RegisterForEvent / RequestRegisterForEvent`.
 
 ## 11. Other useful verified APIs
 - `api.time`: `GetDeltaTime`, `GetDeltaTimeUnscaled`, `GetTotalTimeUnscaled`, `Pause`, `Unpause`, `SetTimeScaler`, `AcquireTimeScaler`.
@@ -364,6 +344,8 @@ same root.
   - World `tWorldAPIs.bakedanimation` (colon syntax): `RequestAllBonesForCalculate(nEntityID)`, `GetFloatStreamValue(nEntityID, sName)`.
   - World `tWorldAPIs.animation` (colon syntax, drives skeletal `.mani` `Animation` component): `PlayAnimation`, `SetPlaybackRate`, `SetPlaybackDirection`, `SetPropThrough`, `GetPropThrough`, `GetLength`, `GetFloatStreamValue`.
   - Clean animated avatar recipe (`src/ovl_mod/pz2coop.avatar.lua`): spawn a Lua root table with `Transform`, `AssetPackageLoader({PackageNames = {"CharacterPatterns", "Guests"}})`, `AssetPackageProvider`, `ModelSkeleton`, `BakedAnimation`, `AnimationControl`, `LevelOfDetail`, `RenderBoundingVolume`, `RenderGroup` (omitting crowd components `GuestVisual`/`GuestAnimation`/`BakedAnimTree` that crash outside the crowd sim, and omitting `MotionGraph`), then attach each multipart part (`Head`, `Hair`, `Torso`, `Legs`, optional `Accessory`/`Beard`) using vanilla `"PeepBodyPart"` with `BoundingScaler` and props from `api.multipart2.GetProperties(tAvatar)`. Switch clips at runtime via `api.animationcontrol.SetBaseAnimation(nAvatarID, "<G>$WalkBase")`.
+- **Do NOT retry on avatars:** spawning `Peep` / `Peep_Acc` / `Peep_Avatar` crashes (`PlanetZoo2.exe+0xb9af7b2`); spawning with `MotionGraphName = ""` crashes; setting `DefaultAnimName` via `GetProperties` is overridden by the motion graph; `pairs()` on world API tables misses lazily bound methods.
+- **Native IK feasibility (future research):** `PlanetZoo2.exe` ships CPU `IKHeadLook` + `IKFootPlant`, but they only run on CPU skeletal `Animation` (`.mani`, Staff OVLs, `AF`/`AM` only — no Teen `TF`/`TM` locomotion `.mani` clips), not GPU `BakedAnimation` (`.bani` in `Guests.ovl`).
 - Staff skeletal `.mani` animations (`Content0/Characters/Staff/<Role>/<Role>.ovl`, `AF`/`AM` only — no Teen `TF`/`TM`): `<Role><AF|AM>$StandIdleContent01`, `Walk*OnSpot`, `RunOnSpot`, plus `WildLifeResearcher` crouch/prone/camera/binoculars and `Diver` swim clips. Share core `def_c_*`/`def_l_*`/`def_r_*` bones with avatars.
 - Own pose: `CameraModeManager:GetPosYPRZoom()` -> `vPos, vYPR, nZoom` (yaw = `vYPR:X()`), `GetCurrentModeName()`,
   `GetCameraDataFinal()` -> `tFinal` (`vCentrePos` = orbit centre) (`cameramodemanager.lua:588,725-758`).

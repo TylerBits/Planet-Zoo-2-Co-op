@@ -239,8 +239,14 @@ local InstallSaveAgentHooks = function()
       Log("exit to main menu without saving host zoo")
       if Bridge.GetRole() == "client" then
         Bridge.SendCommand("leave")
+        Bridge.Flush(true)
       end
       return _fnOrig(self, _hudUI, true, false, ...)
+    end
+    if Bridge.GetRole() == "host" then
+      Log("host returning to start screen: closing co-op room")
+      Bridge.SendCommand("leave")
+      Bridge.Flush(true)
     end
     return _fnOrig(self, _hudUI, _bSuppressSave, _bTakeScreenshot, ...)
   end)
@@ -249,8 +255,14 @@ local InstallSaveAgentHooks = function()
       Log("quit game without saving host zoo")
       if Bridge.GetRole() == "client" then
         Bridge.SendCommand("leave")
+        Bridge.Flush(true)
       end
       return _fnOrig(self, _hudUI, true, false, ...)
+    end
+    if Bridge.GetRole() == "host" then
+      Log("host quitting game: closing co-op room")
+      Bridge.SendCommand("leave")
+      Bridge.Flush(true)
     end
     return _fnOrig(self, _hudUI, _bSuppressSave, _bTakeScreenshot, ...)
   end)
@@ -355,12 +367,40 @@ local InstallScenarioAutosaveHook = function()
   end)
 end
 
+-- Also catches Career/Scenario fanfare "Return to Menu" (ObjectiveManager.ReturnToMainMenu) and any
+-- other path that returns to the main menu, without firing when opening the Conservation Map / Animal Market.
+local InstallReturnToMenuHooks = function()
+  local fnWrap = function(_fnOrig, self, ...)
+    if Bridge.GetRole() == "host" then
+      Log("host leaving world to start screen: closing co-op room")
+      Bridge.SendCommand("leave")
+      Bridge.Flush(true)
+    end
+    return _fnOrig(self, ...)
+  end
+  local bOk, BgMgr = pcall(require, "Managers.BackgroundWorldDataManager")
+  if bOk and type(BgMgr) == "table" then
+    WrapMethod(BgMgr, "SetupHUDForReturnToStartScreen", fnWrap)
+  end
+  local bEnvOk, oBg = pcall(function()
+    local env = api.game and api.game.GetEnvironment and api.game.GetEnvironment()
+    if env ~= nil and env.RequestInterface ~= nil then
+      return env:RequestInterface("Interfaces.IBackgroundWorldDataManager")
+    end
+    return nil
+  end)
+  if bEnvOk and type(oBg) == "table" then
+    WrapMethod(oBg, "SetupHUDForReturnToStartScreen", fnWrap)
+  end
+end
+
 -- Safe to call every frame: each wrap guards itself with a sentinel key.
 SaveGuard.Install = function()
   InstallParkLoadSaveHooks()
   InstallSaveAgentHooks()
   InstallMainHUDHooks()
   InstallScenarioAutosaveHook()
+  InstallReturnToMenuHooks()
 end
 
 SaveGuard.OnParkStart = function()

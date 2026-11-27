@@ -13,6 +13,8 @@ __pycache__/
 # Runtime / crash artefacts
 *.dmp
 diag*.log
+*.log
+*.zip
 
 # Local external tooling (downloaded / cloned on dev machine)
 tools/cmake/
@@ -32,11 +34,8 @@ tools/unluac.jar
 AGENTS.md
 CLAUDE.md
 docs/HANDOFF.md
-docs/MEGA_TEST.md
 docs/RELEASE_CHECKLIST.md
-docs/AAA_AVATAR_LOCOMOTION_PLAN.md
-docs/PLAYER_NPC_ACTIVITIES_PLAN.md
-docs/THIRD_PERSON.md
+docs/agent_execution_plan_*.md
 docs/brand/
 docs/nexus/
 assets/brand/

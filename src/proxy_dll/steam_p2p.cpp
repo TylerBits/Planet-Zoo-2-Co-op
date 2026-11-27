@@ -442,17 +442,19 @@ void emitError(const char* code) { emit(std::string(R"({"event":"error","code":"
 // SteamAPI_RunCallbacks never overlap: both hold this lock. Recursive in case a game callback re-enters.
 std::recursive_mutex g_steamMutex;
 using RunCallbacksFn = void (*)();
-RunCallbacksFn g_gameRunCallbacks = nullptr;
+// Written by patchExeImport before the IAT slot points at hkRunCallbacks: the game calls RunCallbacks every
+// frame, and assigning it after the patch returned crashed launches that hit the gap (null call).
+void* g_gameRunCallbacks = nullptr;
 
 void hkRunCallbacks() {
     std::lock_guard lock(g_steamMutex);
-    g_gameRunCallbacks();
+    reinterpret_cast<RunCallbacksFn>(g_gameRunCallbacks)();
 }
 
 // Called once Steam is initialised, so the loader has long since bound the game's steam_api64 imports.
 void hookGameRunCallbacks() {
-    g_gameRunCallbacks = reinterpret_cast<RunCallbacksFn>(
-        patchExeImport("steam_api64.dll", "SteamAPI_RunCallbacks", reinterpret_cast<void*>(&hkRunCallbacks)));
+    patchExeImport("steam_api64.dll", "SteamAPI_RunCallbacks", reinterpret_cast<void*>(&hkRunCallbacks),
+                   g_gameRunCallbacks);
     diagLog(g_gameRunCallbacks != nullptr ? "steam: game's SteamAPI_RunCallbacks now shares our Steam lock"
                                           : "steam: SteamAPI_RunCallbacks import not found; Steam calls not serialised");
 }
@@ -504,8 +506,8 @@ private:
             flushReliable();
         }
         if (ready_ && now >= nextUnreliableFlush) {
-            flushUnreliable(); // Channel 1 runs at 20 Hz: only the newest packet per type goes out.
-            nextUnreliableFlush = now + 50ms;
+            flushUnreliable(); // Channel 1 runs at 40 Hz so 20 Hz presence poses don't alias/stutter.
+            nextUnreliableFlush = now + 25ms;
         }
     }
 

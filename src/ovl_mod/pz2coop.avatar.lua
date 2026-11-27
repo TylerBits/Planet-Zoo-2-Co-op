@@ -30,7 +30,9 @@ local Avatar = module(...)
 local c_nSpeedSmoothRate = 12.0 -- per second exponential smoothing for horizontal speed
 local c_nAccelSmoothRate = 6.5 -- GTA-style weighted speed ramp-up (idle -> walk -> jog -> sprint)
 local c_nDecelSmoothRate = 26.0 -- snappy braking so run/jog stops cleanly without running in place
+local c_nRemoteDecelSmoothRate = 8.5 -- gentler deceleration for networked peers to prevent mid-stride stutter
 local c_nStopSnapDelay = 0.04 -- seconds of near-zero raw speed before snapping directly to idle
+local c_nRemoteStopSnapDelay = 0.22 -- covers network packet jitter so remote peers don't blink to idle mid-walk
 local c_nRateMin = 0.58
 local c_nRateMax = 1.42
 local c_nRateEpsilon = 0.04
@@ -79,6 +81,30 @@ local c_nPitchBrakeMin = -0.052 -- ~-3 deg upright brace on hard braking
 local c_nSwimForwardPitch = 0.28 -- ~16 deg forward torso pitch while actively swimming
 local c_nSlopeLeanMax = 0.14   -- ~8 deg uphill/downhill posture tilt
 local c_nLeanStiffness = 14.0
+
+-- Constrained third-person & co-op friend head tracking (anatomical neck limits + front-orbit dead-zone).
+-- Limits & dynamic collar-tuck keep the rigid Head/Torso neckline seam sealed with zero hollow-body gap.
+local c_nHeadYawMax = math.rad(48)          -- max neck-only horizontal turn without opening sloped collar seam
+local c_nHeadYawGain = 0.85                 -- subtle softness inside active tracking cone
+local c_nHeadHoldEnd = math.rad(100)        -- hold near max yaw when glancing over shoulder
+local c_nHeadReturnEnd = math.rad(140)      -- smoothly relax to neutral by 140 deg (looking at self)
+local c_nHeadPitchUpMax = math.rad(22)      -- negative pitch in PZ2 = looking up
+local c_nHeadPitchDownMax = math.rad(18)    -- positive pitch in PZ2 = looking down
+local c_nHeadPitchSwimDownMax = math.rad(10)-- keep face above waterline while swimming
+local c_nHeadPitchGain = 0.80
+local c_nHeadSpringOmega = 9.0              -- natural angular frequency (rad/s) for exact critically damped spring
+local c_nHeadNeutralEps = 0.002
+local c_nNeckSeamDrop = 0.045               -- shift pivot down from def_c_neck1_joint (1.369 m) to collar seam (~1.324 m)
+local c_nCollarTuckPitch = 0.065            -- -Y collar tuck per sin(|pitch|) so lifted throat/nape rim stays inside shirt
+local c_nCollarTuckYaw = 0.030              -- -Y collar tuck per (1 - cos(yaw)) for sloped neckline seam
+local c_tFallbackNeckPivot = {0.0, 1.37, 0.08}
+
+-- Upper/lower-body split for 1P strafing & backpedaling: twists Legs RenderGroup independently of Torso.
+local c_nLegsTwistMax = math.rad(62)        -- max lower-body yaw twist relative to torso while strafing
+local c_nLegsBackThreshold = math.rad(105)  -- beyond +/-105 deg from facing, treat as backpedaling (reverse stride)
+local c_nLegsSpringOmega = 14.0             -- responsive critically damped spring for leg twist
+local c_nLegsNeutralEps = 0.002
+local c_bAllowReversePlayback = true        -- negative SetPlaybackRate on BakedAnimation for backwards stepping
 
 -- Suffixes in Guests.ovl (baked .bani clips: AF, AM, TF, TM all ship these exact names).
 local c_tClipSuffix = {
@@ -130,6 +156,30 @@ local Clamp = function(_n, _lo, _hi)
   return _n
 end
 
+local WrapAngle = function(_n)
+  return (_n + math.pi) % (2 * math.pi) - math.pi
+end
+
+-- Classifies PeepBodyPart children that rotate rigidly with the head around def_c_neck1_joint.
+-- Excludes torso-mounted accessories (backpacks, audio guides) if ever present in the Accessory slot.
+local IsHeadLookPart = function(_sPartName, _sModelName)
+  if _sPartName == "Head" or _sPartName == "Hair" or _sPartName == "Beard" then
+    return true
+  end
+  if _sPartName == "Accessory" then
+    if type(_sModelName) == "string" then
+      local sLow = string.lower(_sModelName)
+      if string.find(sLow, "backpack", 1, true) ~= nil or string.find(sLow, "audioguide", 1, true) ~= nil then
+        return false
+      end
+    end
+    return true
+  end
+  return false
+end
+
+Avatar.IsHeadLookPart = IsHeadLookPart
+
 -- Maps avatar group ("TMA", "AFA", "TM", etc.) to its 2-letter animation prefix ("AF", "AM", "TF", "TM").
 Avatar.GroupPrefix = function(_sGroup)
   if type(_sGroup) == "string" and #_sGroup >= 2 then
@@ -146,12 +196,16 @@ Avatar.GetClipName = function(_sGroup, _sState)
   return Avatar.GroupPrefix(_sGroup) .. sSuffix
 end
 
-Avatar.CreateAnimState = function(_sGroup, _bAnimated)
+Avatar.CreateAnimState = function(_sGroup, _bAnimated, _tMeta, _sInitialClipSuffix)
+  local tMeta = type(_tMeta) == "table" and _tMeta or nil
+  local sPrefix = Avatar.GroupPrefix(_sGroup)
+  local sInitClip = (type(_sInitialClipSuffix) == "string" and _sInitialClipSuffix ~= "")
+    and (sPrefix .. _sInitialClipSuffix) or Avatar.GetClipName(sPrefix, "idle")
   return {
-    sGroup = Avatar.GroupPrefix(_sGroup),
+    sGroup = sPrefix,
     bAnimated = _bAnimated == true,
     sState = "idle",
-    sClip = Avatar.GetClipName(_sGroup, "idle"),
+    sClip = sInitClip,
     nSmoothSpeed = 0,
     nPrevSmoothSpeed = 0,
     nStopTime = 0,
@@ -166,6 +220,7 @@ Avatar.CreateAnimState = function(_sGroup, _bAnimated)
     nNextFidget = 18.0,
     nFidgetIdx = 1,
     bOneShotActive = false,
+    nOneShotUntil = 0,
     nSprintAccum = 0,
     bSprintFatigueArmed = false,
     nTiredRemain = 0,
@@ -173,13 +228,27 @@ Avatar.CreateAnimState = function(_sGroup, _bAnimated)
     nWalkVariantIdx = 1,
     nLastPivotAt = -10.0,
     sWeather = "clear",
-    -- Action / emote base override (sit, dance, photo, hold-hands, prop pose)
+    -- Action / emote base override (sit, dance, photo, prop pose)
     sOverrideSuffix = nil,
     -- Procedural lean springs
     nRoll = 0,
     nRollVel = 0,
     nPitch = 0,
     nPitchVel = 0,
+    -- Constrained head-look spring, dedicated HeadRig RenderGroup entity, & live neck pivot AttachPoint
+    nHeadYaw = 0,
+    nHeadYawVel = 0,
+    nHeadPitch = 0,
+    nHeadPitchVel = 0,
+    bHeadNeutral = true,
+    nHeadRig = tMeta and tMeta.nHeadRig or nil,
+    tHeadParts = tMeta and tMeta.tHeadParts or nil,
+    nNeckAttach = tMeta and tMeta.nNeckAttach or nil,
+    -- Lower-body LegsRig RenderGroup & twist spring (1P strafing / diagonal / backpedal upper-lower split)
+    nLegsRig = tMeta and tMeta.nLegsRig or nil,
+    nLegsYaw = 0,
+    nLegsYawVel = 0,
+    bLegsNeutral = true,
     -- Attached hand-bone prop
     tProp = nil, -- {nAttachId, nPropId, sPrefab, sBone}
   }
@@ -280,6 +349,7 @@ Avatar.PlayOneShot = function(_tAnim, _nAvatarID, _sClipSuffix)
   local bOk = pcall(ac.QueueOneShotAnimation, _nAvatarID, sClip)
   if bOk then
     _tAnim.bOneShotActive = true
+    _tAnim.nOneShotUntil = (_tAnim.nClock or 0) + 2.5
   end
   return bOk
 end
@@ -289,6 +359,7 @@ Avatar.CancelOneShot = function(_tAnim, _nAvatarID)
     return
   end
   _tAnim.bOneShotActive = false
+  _tAnim.nOneShotUntil = 0
   local ac = api.animationcontrol
   if ac == nil then
     return
@@ -390,6 +461,331 @@ Avatar.StepBodyLean = function(_tAnim, _nYawRate, _nSpeed, _nDt, _bInWater, _nSl
   return _tAnim.nPitch, _tAnim.nRoll
 end
 
+-- Computes constrained target (yaw, pitch, weight) for head tracking given body-relative camera angles.
+--   - 0..65 deg: smooth tracking (0.9x gain, clamped to +/-62 deg)
+--   - 65..100 deg: holds naturally near +/-62 deg shoulder limit
+--   - 100..140 deg: smoothstep falloff 1 -> 0 so orbiting in front to look at oneself relaxes to neutral
+--   - 140..180 deg: neutral (0, 0) with zero snap when crossing +/-180 deg
+Avatar.ComputeHeadLookTarget = function(_nRelYaw, _nRelPitch, _bInWater, _bSuppress)
+  if _bSuppress == true then
+    return 0, 0, 0
+  end
+  local nRelYaw = (type(_nRelYaw) == "number" and _nRelYaw == _nRelYaw) and WrapAngle(_nRelYaw) or 0
+  local nRelPitch = (type(_nRelPitch) == "number" and _nRelPitch == _nRelPitch) and _nRelPitch or 0
+  local nAbsYaw = math.abs(nRelYaw)
+  local nWeight = 1.0
+  if nAbsYaw >= c_nHeadReturnEnd then
+    nWeight = 0.0
+  elseif nAbsYaw > c_nHeadHoldEnd then
+    local t = (nAbsYaw - c_nHeadHoldEnd) / (c_nHeadReturnEnd - c_nHeadHoldEnd)
+    nWeight = 1.0 - t * t * (3.0 - 2.0 * t)
+  end
+  if nWeight <= 0 then
+    return 0, 0, 0
+  end
+  local nRawYaw = Clamp(nRelYaw * c_nHeadYawGain, -c_nHeadYawMax, c_nHeadYawMax)
+  local nDownMax = _bInWater == true and c_nHeadPitchSwimDownMax or c_nHeadPitchDownMax
+  local nRawPitch = Clamp(nRelPitch * c_nHeadPitchGain, -c_nHeadPitchUpMax, nDownMax)
+  return nRawYaw * nWeight, nRawPitch * nWeight, nWeight
+end
+
+-- Exact Cobra YPR rotation matching CameraUtils.RedoYPR & Quaternion.FromYawPitchRoll:
+-- pitch around +X first (+pitch tilts +Z down toward -Y and +Y forward toward +Z), then yaw around +Y (+Z toward +X).
+local RotateVecYPR = function(_nX, _nY, _nZ, _nYaw, _nPitch)
+  local cp, sp = math.cos(_nPitch), math.sin(_nPitch)
+  local cy, sy = math.cos(_nYaw), math.sin(_nYaw)
+  local x1 = _nX
+  local y1 = _nY * cp - _nZ * sp
+  local z1 = _nY * sp + _nZ * cp
+  return x1 * cy + z1 * sy, y1, -x1 * sy + z1 * cy
+end
+
+-- Computes local TransformQ rotating head-group meshes by (_nYaw, _nPitch) around avatar-local neck-seam pivot
+-- (_nPx, _nPy, _nPz) with optional downward collar-tuck sink (_nSinkY) so the neckline rim stays tucked inside the torso.
+Avatar.ComputePivotTransform = function(_nYaw, _nPitch, _nPx, _nPy, _nPz, _nSinkY)
+  local qHead = Quaternion.FromYawPitchRoll(Vector3:new(_nYaw, _nPitch, 0))
+  local rx, ry, rz = nil, nil, nil
+  local trRot = TransformQ.FromOrPos(qHead, Vector3:new(0, 0, 0))
+  if trRot ~= nil and trRot.ToWorldPos ~= nil then
+    local bOk, vRot = pcall(trRot.ToWorldPos, trRot, Vector3:new(_nPx, _nPy, _nPz))
+    if bOk and vRot ~= nil then
+      local bC, x, y, z = pcall(function()
+        return vRot.GetX and vRot:GetX() or vRot:X(),
+          vRot.GetY and vRot:GetY() or vRot:Y(),
+          vRot.GetZ and vRot:GetZ() or vRot:Z()
+      end)
+      if bC and type(x) == "number" and x == x then
+        rx, ry, rz = x, y, z
+      end
+    end
+  end
+  if rx == nil then
+    rx, ry, rz = RotateVecYPR(_nPx, _nPy, _nPz, _nYaw, _nPitch)
+  end
+  local nSink = type(_nSinkY) == "number" and _nSinkY or 0
+  return TransformQ.FromOrPos(qHead, Vector3:new(_nPx - rx, _nPy - ry - nSink, _nPz - rz))
+end
+
+local ApplyHeadPartsTransform = function(_tAnim, _trLocal)
+  if _tAnim == nil then
+    return
+  end
+  local tWorld = WorldAPIs()
+  local tr = tWorld and tWorld.transform
+  if tr == nil or tr.SetTransform == nil then
+    return
+  end
+  -- Primary path: rotate the dedicated HeadRig RenderGroup parent so GPU RenderGroupMember
+  -- (UseGroupBackendEntry) renders Head, Hair, Beard, Glasses, and child Hat with the exact transform.
+  if _tAnim.nHeadRig ~= nil then
+    pcall(tr.SetTransform, tr, _tAnim.nHeadRig, _trLocal)
+    return
+  end
+  local tParts = _tAnim.tHeadParts
+  if type(tParts) ~= "table" or #tParts == 0 then
+    return
+  end
+  for _, nPartID in ipairs(tParts) do
+    pcall(tr.SetTransform, tr, nPartID, _trLocal)
+  end
+end
+
+-- Hides/shows both the avatar root RenderGroup and the dedicated HeadRig RenderGroup together.
+-- Cobra's model:SetHidden is reference-counted, so track bRootHidden & bHeadRigHidden to never double-call.
+-- Respects _tAnim.bHeadHidden so unhiding the body in 1P keeps the head hidden.
+Avatar.SetHidden = function(_tAnim, _nAvatarID, _bHidden)
+  local tWorld = WorldAPIs()
+  local model = tWorld and tWorld.model
+  if model == nil or model.SetHidden == nil then
+    return
+  end
+  local bHideRoot = _bHidden == true
+  if _nAvatarID ~= nil then
+    if _tAnim == nil or (_tAnim.bRootHidden == true) ~= bHideRoot then
+      if _tAnim ~= nil then
+        _tAnim.bRootHidden = bHideRoot
+      end
+      pcall(model.SetHidden, model, _nAvatarID, bHideRoot)
+    end
+  end
+  local bHideHead = bHideRoot or (_tAnim ~= nil and _tAnim.bHeadHidden == true)
+  if _tAnim ~= nil and (_tAnim.bHeadRigHidden == true) ~= bHideHead then
+    _tAnim.bHeadRigHidden = bHideHead
+    if _tAnim.nHeadRig ~= nil then
+      pcall(model.SetHidden, model, _tAnim.nHeadRig, bHideHead)
+    elseif type(_tAnim.tHeadParts) == "table" then
+      for _, nPartID in ipairs(_tAnim.tHeadParts) do
+        pcall(model.SetHidden, model, nPartID, bHideHead)
+      end
+    end
+  end
+  if _tAnim ~= nil and _tAnim.nLegsRig ~= nil and (_tAnim.bLegsRigHidden == true) ~= bHideRoot then
+    _tAnim.bLegsRigHidden = bHideRoot
+    pcall(model.SetHidden, model, _tAnim.nLegsRig, bHideRoot)
+  end
+end
+
+-- Hides/shows ONLY the head-group RenderGroup (Head, Hat, Hair, Beard, Glasses) while keeping the body visible (1P view).
+Avatar.SetHeadHidden = function(_tAnim, _nAvatarID, _bHidden)
+  if _tAnim == nil then
+    return
+  end
+  local bHide = _bHidden == true
+  _tAnim.bHeadHidden = bHide
+  local tWorld = WorldAPIs()
+  local model = tWorld and tWorld.model
+  if model == nil or model.SetHidden == nil then
+    return
+  end
+  local bEffHide = bHide or (_tAnim.bRootHidden == true)
+  if (_tAnim.bHeadRigHidden == true) == bEffHide then
+    return
+  end
+  _tAnim.bHeadRigHidden = bEffHide
+  if _tAnim.nHeadRig ~= nil then
+    pcall(model.SetHidden, model, _tAnim.nHeadRig, bEffHide)
+    return
+  end
+  if type(_tAnim.tHeadParts) == "table" then
+    for _, nPartID in ipairs(_tAnim.tHeadParts) do
+      pcall(model.SetHidden, model, nPartID, bEffHide)
+    end
+  end
+end
+
+local ReadLocalNeckPivot = function(_tAnim, _nAvatarID)
+  local nNeck = _tAnim and _tAnim.nNeckAttach
+  if nNeck ~= nil and _nAvatarID ~= nil then
+    local bOk, px, py, pz = pcall(function()
+      local tr = WorldAPIs().transform
+      if tr == nil or tr.CalculateWorldTransform == nil then
+        return nil
+      end
+      local trAvatar = tr:CalculateWorldTransform(_nAvatarID)
+      local trNeck = tr:CalculateWorldTransform(nNeck)
+      if trAvatar == nil or trNeck == nil or trAvatar.ToLocalPos == nil then
+        return nil
+      end
+      local vNeckWorld = trNeck.GetPos and trNeck:GetPos() or (trNeck.Pos and trNeck:Pos())
+      if vNeckWorld == nil then
+        return nil
+      end
+      local vLocal = trAvatar:ToLocalPos(vNeckWorld)
+      if vLocal == nil then
+        return nil
+      end
+      local lx = vLocal.GetX and vLocal:GetX() or vLocal:X()
+      local ly = vLocal.GetY and vLocal:GetY() or vLocal:Y()
+      local lz = vLocal.GetZ and vLocal:GetZ() or vLocal:Z()
+      if type(lx) == "number" and lx == lx and type(ly) == "number" and ly == ly and type(lz) == "number" and lz == lz and
+        ly >= 0.15 and ly <= 2.2 and math.abs(lx) <= 0.8 and math.abs(lz) <= 0.8 then
+        return lx, ly, lz
+      end
+      return nil
+    end)
+    if bOk and px ~= nil then
+      return px, py, pz, true
+    end
+  end
+  return c_tFallbackNeckPivot[1], c_tFallbackNeckPivot[2], c_tFallbackNeckPivot[3], false
+end
+
+Avatar.GetLocalNeckPivot = ReadLocalNeckPivot
+
+Avatar.ResetHeadLook = function(_tAnim)
+  if _tAnim == nil then
+    return
+  end
+  _tAnim.nHeadYaw, _tAnim.nHeadYawVel = 0, 0
+  _tAnim.nHeadPitch, _tAnim.nHeadPitchVel = 0, 0
+  if not _tAnim.bHeadNeutral then
+    _tAnim.bHeadNeutral = true
+    ApplyHeadPartsTransform(_tAnim, TransformQ.Identity)
+  end
+end
+
+-- Exact analytical critically damped spring (unconditionally stable at any dt / framerate, zero overshoot).
+local StepDampedSpring = function(_nVal, _nVel, _nTarget, _nOmega, _nDt)
+  local nDiff = _nVal - _nTarget
+  local nB = _nVel + _nOmega * nDiff
+  local nExp = math.exp(-_nOmega * _nDt)
+  return _nTarget + (nDiff + nB * _nDt) * nExp, (_nVel - nB * _nOmega * _nDt) * nExp
+end
+
+-- Smoothly rotates the HeadRig RenderGroup (Head [+ child Hat], Hair, Beard, Glasses) to follow camera look.
+Avatar.UpdateHeadLook = function(_tAnim, _nAvatarID, _nCamYaw, _nCamPitch, _nBodyYaw, _nBodyPitch, _nDt, _bInWater, _bSeated)
+  if _tAnim == nil or not _tAnim.bAnimated or _nAvatarID == nil or
+    (_tAnim.nHeadRig == nil and (type(_tAnim.tHeadParts) ~= "table" or #_tAnim.tHeadParts == 0)) then
+    return 0, 0
+  end
+  local nDt = (type(_nDt) == "number" and _nDt > 0) and math.min(_nDt, 0.1) or (1 / 60)
+  -- Keep live CPU neck bone transform updated each frame when using BakedAnimation.
+  if _tAnim.nNeckAttach ~= nil then
+    pcall(function()
+      local baked = WorldAPIs().bakedanimation
+      if baked ~= nil and baked.RequestAllBonesForCalculate ~= nil then
+        baked:RequestAllBonesForCalculate(_nAvatarID)
+      end
+    end)
+  end
+  local bSuppress = _tAnim.bOneShotActive == true or (_tAnim.sOverrideSuffix ~= nil and _bSeated ~= true)
+  local nRelYaw = (type(_nCamYaw) == "number" and type(_nBodyYaw) == "number") and WrapAngle(_nCamYaw - _nBodyYaw) or 0
+  local nRelPitch = (type(_nCamPitch) == "number" and _nCamPitch == _nCamPitch and _nCamPitch or 0) -
+    (type(_nBodyPitch) == "number" and _nBodyPitch == _nBodyPitch and _nBodyPitch or 0)
+  local nTargetYaw, nTargetPitch = Avatar.ComputeHeadLookTarget(nRelYaw, nRelPitch, _bInWater == true, bSuppress)
+  _tAnim.nHeadYaw, _tAnim.nHeadYawVel = StepDampedSpring(_tAnim.nHeadYaw or 0, _tAnim.nHeadYawVel or 0, nTargetYaw, c_nHeadSpringOmega, nDt)
+  _tAnim.nHeadPitch, _tAnim.nHeadPitchVel = StepDampedSpring(_tAnim.nHeadPitch or 0, _tAnim.nHeadPitchVel or 0, nTargetPitch, c_nHeadSpringOmega, nDt)
+
+  local bSettledNeutral = math.abs(_tAnim.nHeadYaw) < c_nHeadNeutralEps and math.abs(_tAnim.nHeadPitch) < c_nHeadNeutralEps and
+    math.abs(nTargetYaw) < c_nHeadNeutralEps and math.abs(nTargetPitch) < c_nHeadNeutralEps
+  if bSettledNeutral then
+    _tAnim.nHeadYaw, _tAnim.nHeadYawVel = 0, 0
+    _tAnim.nHeadPitch, _tAnim.nHeadPitchVel = 0, 0
+    if not _tAnim.bHeadNeutral then
+      _tAnim.bHeadNeutral = true
+      ApplyHeadPartsTransform(_tAnim, TransformQ.Identity)
+    end
+    return 0, 0
+  end
+
+  _tAnim.bHeadNeutral = false
+  local px, py, pz = ReadLocalNeckPivot(_tAnim, _nAvatarID)
+  -- Pivot right at the bottom collar seam (4.5 cm below def_c_neck1_joint) and tuck slightly down into the
+  -- torso collar as pitch/yaw increase (0 cm at neutral) so the hollow torso interior never shows through.
+  local nSeamY = py - c_nNeckSeamDrop
+  local nSinkY = c_nCollarTuckPitch * math.sin(math.abs(_tAnim.nHeadPitch)) +
+    c_nCollarTuckYaw * (1.0 - math.cos(_tAnim.nHeadYaw))
+  local trHead = Avatar.ComputePivotTransform(_tAnim.nHeadYaw, _tAnim.nHeadPitch, px, nSeamY, pz, nSinkY)
+  ApplyHeadPartsTransform(_tAnim, trHead)
+  return _tAnim.nHeadYaw, _tAnim.nHeadPitch
+end
+
+local ApplyLegsTransform = function(_tAnim, _trLocal)
+  if _tAnim == nil or _tAnim.nLegsRig == nil then
+    return
+  end
+  local tWorld = WorldAPIs()
+  local tr = tWorld and tWorld.transform
+  if tr == nil or tr.SetTransform == nil then
+    return
+  end
+  pcall(tr.SetTransform, tr, _tAnim.nLegsRig, _trLocal)
+end
+
+-- Computes target lower-body yaw twist (radians) and whether to play the stride clip in reverse
+-- from the body-relative horizontal movement angle (_nRelMoveAngle, 0 = forward, +/-pi/2 = strafe, +/-pi = backward).
+Avatar.ComputeLegsTwistTarget = function(_nRelMoveAngle, _nSpeed, _bEnable)
+  if _bEnable ~= true or type(_nRelMoveAngle) ~= "number" or _nRelMoveAngle ~= _nRelMoveAngle or
+    type(_nSpeed) ~= "number" or _nSpeed < c_nWalkExit then
+    return 0, false
+  end
+  local nRel = WrapAngle(_nRelMoveAngle)
+  if math.abs(nRel) > c_nLegsBackThreshold then
+    local nBackAngle = WrapAngle(nRel + math.pi)
+    return Clamp(nBackAngle, -c_nLegsTwistMax, c_nLegsTwistMax), true
+  end
+  return Clamp(nRel, -c_nLegsTwistMax, c_nLegsTwistMax), false
+end
+
+Avatar.ResetLegsTwist = function(_tAnim)
+  if _tAnim == nil then
+    return
+  end
+  _tAnim.nLegsYaw, _tAnim.nLegsYawVel = 0, 0
+  if not _tAnim.bLegsNeutral then
+    _tAnim.bLegsNeutral = true
+    ApplyLegsTransform(_tAnim, TransformQ.Identity)
+  end
+end
+
+-- Smoothly twists the dedicated LegsRig RenderGroup into the strafe/diagonal travel direction in 1P
+-- while keeping the Torso aligned with the camera. Returns (nLegsYaw, bReverseStride).
+Avatar.UpdateLegsTwist = function(_tAnim, _nRelMoveAngle, _nSpeed, _nDt, _bEnable)
+  if _tAnim == nil or not _tAnim.bAnimated or _tAnim.nLegsRig == nil then
+    local _, bRev = Avatar.ComputeLegsTwistTarget(_nRelMoveAngle, _nSpeed, _bEnable)
+    return 0, bRev
+  end
+  local nDt = (type(_nDt) == "number" and _nDt > 0) and math.min(_nDt, 0.1) or (1 / 60)
+  local bActive = _bEnable == true and _tAnim.sOverrideSuffix == nil and _tAnim.bOneShotActive ~= true
+  local nTargetYaw, bReverse = Avatar.ComputeLegsTwistTarget(_nRelMoveAngle, _nSpeed, bActive)
+  _tAnim.nLegsYaw, _tAnim.nLegsYawVel = StepDampedSpring(_tAnim.nLegsYaw or 0, _tAnim.nLegsYawVel or 0,
+    nTargetYaw, c_nLegsSpringOmega, nDt)
+  local bSettledNeutral = math.abs(_tAnim.nLegsYaw) < c_nLegsNeutralEps and math.abs(nTargetYaw) < c_nLegsNeutralEps
+  if bSettledNeutral then
+    _tAnim.nLegsYaw, _tAnim.nLegsYawVel = 0, 0
+    if not _tAnim.bLegsNeutral then
+      _tAnim.bLegsNeutral = true
+      ApplyLegsTransform(_tAnim, TransformQ.Identity)
+    end
+    return 0, bReverse
+  end
+  _tAnim.bLegsNeutral = false
+  local trLegs = TransformQ.FromOrPos(Quaternion.FromYawPitchRoll(Vector3:new(_tAnim.nLegsYaw, 0, 0)),
+    Vector3:new(0, 0, 0))
+  ApplyLegsTransform(_tAnim, trLegs)
+  return _tAnim.nLegsYaw, bReverse
+end
+
 -- Attaches a whitelisted prop prefab (from Main_SmallResources.ovl) onto the avatar's hand bone.
 -- Vanilla prop prefabs (umbrella_blue, fad_coffeecup, fad_burger, shoppingbag, mch_novelty_balloon_giraffe, ...)
 -- already include their own BoneTransform with AnimEntity = "../.." (grandparent = avatar with ModelSkeleton).
@@ -474,7 +870,7 @@ local ResolveDesiredClip = function(_tAnim, _sState)
 end
 
 -- Advances smoothed speed, selects gait/swim/weather/fatigue/idle-variety clip with asymmetric crossfade & stride rate.
-Avatar.UpdateAnimation = function(_tAnim, _nAvatarID, _nSpeed, _nDt, _bInWater, _sWeather)
+Avatar.UpdateAnimation = function(_tAnim, _nAvatarID, _nSpeed, _nDt, _bInWater, _sWeather, _bIsRemote, _bReverse)
   if _tAnim == nil or not _tAnim.bAnimated or _nAvatarID == nil then
     return
   end
@@ -504,12 +900,21 @@ Avatar.UpdateAnimation = function(_tAnim, _nAvatarID, _nSpeed, _nDt, _bInWater, 
   else
     _tAnim.nStopTime = 0
   end
-  -- Asymmetric GTA-style momentum smoothing: progressive acceleration, snappy stop directly to idle.
-  local nSmoothRate = (nRawSpeed > _tAnim.nSmoothSpeed) and c_nAccelSmoothRate or c_nDecelSmoothRate
+  -- Asymmetric GTA-style momentum smoothing: progressive acceleration, snappy local stop, jitter-tolerant remote stop.
+  local nDecelRate = _bIsRemote == true and c_nRemoteDecelSmoothRate or c_nDecelSmoothRate
+  local nStopDelay = _bIsRemote == true and c_nRemoteStopSnapDelay or c_nStopSnapDelay
+  local nSmoothRate = (nRawSpeed > _tAnim.nSmoothSpeed) and c_nAccelSmoothRate or nDecelRate
   local k = 1 - math.exp(-nSmoothRate * nDt)
   _tAnim.nSmoothSpeed = _tAnim.nSmoothSpeed + (nRawSpeed - _tAnim.nSmoothSpeed) * k
-  if _tAnim.nStopTime >= c_nStopSnapDelay or _tAnim.nSmoothSpeed < 0.01 then
+  if _tAnim.nStopTime >= nStopDelay or _tAnim.nSmoothSpeed < 0.01 then
     _tAnim.nSmoothSpeed = 0
+  end
+
+  -- Auto-expire one-shot flag once clip completes so standing still after a gate/fidget never pins head-look off.
+  if _tAnim.bOneShotActive and _tAnim.nOneShotUntil ~= nil and _tAnim.nOneShotUntil > 0 and
+    _tAnim.nClock >= _tAnim.nOneShotUntil then
+    _tAnim.bOneShotActive = false
+    _tAnim.nOneShotUntil = 0
   end
 
   -- Instant move-cancel for stationary one-shot fidgets/emotes when the character starts moving.
@@ -519,6 +924,10 @@ Avatar.UpdateAnimation = function(_tAnim, _nAvatarID, _nSpeed, _nDt, _bInWater, 
 
   local sPrevState = _tAnim.sState
   local sNextState = Avatar.PickState(sPrevState, _tAnim.nSmoothSpeed, _bInWater == true)
+  -- Never play JogBase or RunBase in reverse: cap backwards locomotion cleanly to WalkBase.
+  if _bReverse == true and (sNextState == "jog" or sNextState == "run") then
+    sNextState = "walk"
+  end
 
   -- Track sprint duration for post-sprint fatigue, idle variety cycling, bored fidgets, and walk variety.
   if sNextState == "run" then
@@ -575,6 +984,10 @@ Avatar.UpdateAnimation = function(_tAnim, _nAvatarID, _nSpeed, _nDt, _bInWater, 
 
   local sTargetClip = ResolveDesiredClip(_tAnim, sNextState)
   local nTargetRate = _tAnim.sOverrideSuffix ~= nil and 1.0 or TargetPlaybackRate(sNextState, _tAnim.nSmoothSpeed)
+  if c_bAllowReversePlayback and _bReverse == true and _tAnim.sOverrideSuffix == nil and
+    sNextState ~= "idle" and sNextState ~= "swim" then
+    nTargetRate = -nTargetRate
+  end
 
   if sNextState ~= sPrevState or sTargetClip ~= _tAnim.sClip then
     local nBlend = _tAnim.sOverrideSuffix ~= nil and c_nBlendOverride or Avatar.PickBlendTime(sPrevState, sNextState)
@@ -606,6 +1019,8 @@ Avatar.ResetAnimSpeed = function(_tAnim, _nAvatarID)
   _tAnim.nTiredRemain = 0
   _tAnim.nRoll, _tAnim.nRollVel = 0, 0
   _tAnim.nPitch, _tAnim.nPitchVel = 0, 0
+  Avatar.ResetHeadLook(_tAnim)
+  Avatar.ResetLegsTwist(_tAnim)
   if _tAnim.bAnimated and _nAvatarID ~= nil and _tAnim.sOverrideSuffix == nil and _tAnim.sState ~= "idle" then
     local sClip = Avatar.GetClipName(_tAnim.sGroup, "idle")
     if ApplyBaseAnimation(_nAvatarID, sClip, 1.0, c_nBlendStop) then
@@ -673,6 +1088,36 @@ Avatar.BuildRootPrefab = function(_sSkeletonName, _sDefaultAnim)
   }
 end
 
+-- Builds a dedicated child RenderGroup entity for head-group PeepBodyParts (Head, Hair, Beard, Glasses, Hat).
+-- Because PeepBodyPart sets RenderGroupMember.TransformFlags={"UseGroupBackendEntry"}, parenting head parts under
+-- this RenderGroup ensures SetTransform(nHeadRigID, trHead) directly rotates their GPU render matrix while
+-- AnimationProxy (AnimationEntity="../..") continues skinning from the avatar root's BakedAnimation.
+Avatar.BuildHeadRigPrefab = function()
+  return {
+    Components = {
+      Transform = {},
+      AssetPackageProvider = {LoaderPath = ".."},
+      LevelOfDetail = {},
+      RenderBoundingVolume = {LocalCentre = Vector3:new(0, 1.5, 0)},
+      RenderGroup = {LodGroupName = "Characters"},
+    },
+  }
+end
+
+-- Dedicated child RenderGroup for the Legs PeepBodyPart so 1P strafing/diagonals twist lower-body yaw independently
+-- of Torso while AnimationProxy (AnimationEntity="../..") continues skinning from the avatar root's BakedAnimation.
+Avatar.BuildLegsRigPrefab = function()
+  return {
+    Components = {
+      Transform = {},
+      AssetPackageProvider = {LoaderPath = ".."},
+      LevelOfDetail = {},
+      RenderBoundingVolume = {LocalCentre = Vector3:new(0, 0.5, 0)},
+      RenderGroup = {LodGroupName = "Characters"},
+    },
+  }
+end
+
 local WaitToken = function(_token)
   while not api.entity.HaveRequestsCompleted(_token) do
     coroutine.yield()
@@ -681,9 +1126,10 @@ end
 
 -- Coroutine worker: builds a native animated avatar under _nParentID using Guests.ovl baked clips.
 -- Returns (nAvatarID, bAnimated). Falls back cleanly to StartScreenAvatar ("Static") if needed.
-Avatar.CreateAnimated = function(_tAvatar, _nParentID, _sRole)
+Avatar.CreateAnimated = function(_tAvatar, _nParentID, _sRole, _sInitialClipSuffix)
   local sPrefix = Avatar.GroupPrefix(_tAvatar.group)
-  local sDefaultAnim = Avatar.GetClipName(sPrefix, "idle")
+  local sDefaultAnim = (type(_sInitialClipSuffix) == "string" and _sInitialClipSuffix ~= "")
+    and (sPrefix .. _sInitialClipSuffix) or Avatar.GetClipName(sPrefix, "idle")
 
   local bHasControl = api.animationcontrol ~= nil and api.animationcontrol.SetBaseAnimation ~= nil
   local bGotProps, sPrefab, tProps = false, nil, nil
@@ -703,22 +1149,65 @@ Avatar.CreateAnimated = function(_tAvatar, _nParentID, _sRole)
       local tByPart, bNeedToHideHair = SplitMultipartProps(_tAvatar, tProps)
       local nHeadID = nil
       local nHairID = nil
+      local tHeadParts = {}
       local nPartsSpawned = 0
+
+      -- Spawn dedicated HeadRig and LegsRig RenderGroup children under nAvatarID so head & legs obey SetTransform on GPU.
+      local nHeadRigID = nil
+      local headRigToken = api.entity.CreateRequestCompletionToken()
+      local bRigOk, nRigId = pcall(api.entity.InstantiatePrefab, Avatar.BuildHeadRigPrefab(), "PZ2CoopHeadRig",
+        headRigToken, TransformQ.Identity, nAvatarID, true, nil)
+      if bRigOk and nRigId ~= nil then
+        nHeadRigID = nRigId
+        pcall(tWorld.model.SetHidden, tWorld.model, nHeadRigID, true)
+        WaitToken(headRigToken)
+      else
+        Log(_sRole .. " HeadRig spawn failed: " .. tostring(nRigId))
+      end
+
+      local nLegsRigID = nil
+      local legsRigToken = api.entity.CreateRequestCompletionToken()
+      local bLegsOk, nLegsId = pcall(api.entity.InstantiatePrefab, Avatar.BuildLegsRigPrefab(), "PZ2CoopLegsRig",
+        legsRigToken, TransformQ.Identity, nAvatarID, true, nil)
+      if bLegsOk and nLegsId ~= nil then
+        nLegsRigID = nLegsId
+        pcall(tWorld.model.SetHidden, tWorld.model, nLegsRigID, true)
+        WaitToken(legsRigToken)
+      else
+        Log(_sRole .. " LegsRig spawn failed: " .. tostring(nLegsId))
+      end
+
       local partsToken = api.entity.CreateRequestCompletionToken()
 
       for _, sPartName in ipairs(c_tPartOrder) do
         local tPartProps = tByPart[sPartName]
         if tPartProps ~= nil and type(tPartProps.ModelName) == "string" and tPartProps.ModelName ~= "" then
+          local bHeadPart = IsHeadLookPart(sPartName, tPartProps.ModelName)
+          local bLegsPart = (not bHeadPart) and sPartName == "Legs"
+          local nPartParent = nAvatarID
+          if bHeadPart and nHeadRigID ~= nil then
+            nPartParent = nHeadRigID
+          elseif bLegsPart and nLegsRigID ~= nil then
+            nPartParent = nLegsRigID
+          end
+          local tPartComponents = {
+            Model = {BoundingScaler = c_tPartScaler[sPartName] or 10},
+          }
+          if nPartParent ~= nAvatarID then
+            tPartComponents.AnimationProxy = {AnimationEntity = "../.."}
+            tPartComponents.AssetPackageProvider = {LoaderPath = "../.."}
+          end
           local tPartPrefab = {
             Prefab = "PeepBodyPart",
-            Components = {
-              Model = {BoundingScaler = c_tPartScaler[sPartName] or 10},
-            },
+            Components = tPartComponents,
           }
           local bPartOk, nPartID = pcall(api.entity.InstantiatePrefab, tPartPrefab, sPartName, partsToken, nil,
-            nAvatarID, true, tPartProps)
+            nPartParent, true, tPartProps)
           if bPartOk and nPartID ~= nil then
             nPartsSpawned = nPartsSpawned + 1
+            if bHeadPart then
+              table.insert(tHeadParts, nPartID)
+            end
             if sPartName == "Head" then
               nHeadID = nPartID
             elseif sPartName == "Hair" then
@@ -731,6 +1220,12 @@ Avatar.CreateAnimated = function(_tAvatar, _nParentID, _sRole)
       end
 
       if nPartsSpawned > 0 then
+        local nNeckAttach = nil
+        local bNeckOk, nNeckID = pcall(api.entity.InstantiatePrefab, "AttachPoint", "PZ2CoopNeckPivot", partsToken,
+          nil, nAvatarID, true, {AttachBone = "def_c_neck1_joint"})
+        if bNeckOk and nNeckID ~= nil then
+          nNeckAttach = nNeckID
+        end
         WaitToken(partsToken)
         if _tAvatar.items and _tAvatar.items.Hats and type(_tAvatar.items.Hats.prefab) == "string" and nHeadID ~= nil then
           local hatToken = api.entity.CreateRequestCompletionToken()
@@ -749,9 +1244,15 @@ Avatar.CreateAnimated = function(_tAvatar, _nParentID, _sRole)
         end
         pcall(tWorld.transform.SetPosition, tWorld.transform, nAvatarID, Vector3:new(0, 0, 0))
         pcall(tWorld.model.SetHidden, tWorld.model, nAvatarID, false)
-        Log(string.format("%s animated avatar ready (id=%s, group=%s, parts=%d, clip=%s, base=%s)",
-          tostring(_sRole), tostring(nAvatarID), sPrefix, nPartsSpawned, sDefaultAnim, tostring(sPrefab)))
-        return nAvatarID, true
+        if nHeadRigID ~= nil then
+          pcall(tWorld.model.SetHidden, tWorld.model, nHeadRigID, false)
+        end
+        if nLegsRigID ~= nil then
+          pcall(tWorld.model.SetHidden, tWorld.model, nLegsRigID, false)
+        end
+        Log(string.format("%s animated avatar ready (id=%s, headRig=%s, legsRig=%s, group=%s, parts=%d, headParts=%d, clip=%s, base=%s)",
+          tostring(_sRole), tostring(nAvatarID), tostring(nHeadRigID), tostring(nLegsRigID), sPrefix, nPartsSpawned, #tHeadParts, sDefaultAnim, tostring(sPrefab)))
+        return nAvatarID, true, {nHeadRig = nHeadRigID, nLegsRig = nLegsRigID, tHeadParts = tHeadParts, nNeckAttach = nNeckAttach}
       else
         Log(_sRole .. " animated avatar spawned 0 parts; falling back to StartScreenAvatar")
         pcall(api.entity.DestroyEntity, nAvatarID)

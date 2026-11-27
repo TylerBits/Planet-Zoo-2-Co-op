@@ -27,7 +27,7 @@ local c_nSlotClaim, c_nSlotBeat, c_nSlotVersion = 5, 6, 7
 local c_nSlotOutHead, c_nSlotOutTail, c_nSlotInHead, c_nSlotInTail = 9, 10, 11, 12
 local c_nOutData = c_nHeader + 1
 local c_nInData = c_nOutData + c_nRing
-local c_nFlushInterval = 0.05
+local c_nFlushInterval = 0.025
 local c_nHeartbeat = 1.0
 local c_nMaxPendingLines = 4000
 -- ponytail: engine-side file APIs (SaveParkToFile, blueprints) take paths whose root is still unverified;
@@ -36,7 +36,8 @@ local c_sEnginePrefix = "/run/PZ2Coop/"
 -- Solo test mode (Bridge.SetLoopback): mirror offset and a cap so a leaking echo cannot loop forever.
 local c_nLoopOffsetCm = 5000 -- 50 m: wider than the prefab aquariums (29 m)
 local c_nLoopLimit = 200
-local c_nHandshakeHello, c_nSaveChunkData, c_nSaveLoadCommit, c_nCursor, c_nLedgerSync, c_nPresenceAvatar = 0x01, 0x02, 0x03, 0x10, 0x11, 0x12
+local c_nHandshakeHello, c_nSaveChunkData, c_nSaveLoadCommit, c_nCursor, c_nLedgerSync, c_nPresenceAvatar, c_nVehiclePose =
+  0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x13
 local c_sModVersion = "0.3.0"
 -- Offline/local park modes supported in co-op. Franchise is strictly excluded (CLAUDE.md rules 6 & 8).
 local c_tAllowedModes = {
@@ -208,7 +209,7 @@ Bridge.SendPacket = function(_nType, _sFile, _tData)
     tMirror.cx = (tMirror.cx or 0) + c_nLoopOffsetCm / 100
     tMirror.px = (tMirror.px or 0) + c_nLoopOffsetCm / 100
     table.insert(s.tLoopIn, {sKind = "packet", nType = _nType, sFile = nil, tData = tMirror})
-  elseif s.bLoopback and _nType == c_nPresenceAvatar then
+  elseif s.bLoopback and (_nType == c_nPresenceAvatar or _nType == c_nVehiclePose) then
     -- Round-trip through JSON when Parse is available so loopback exercises the real wire format.
     local tMirror = api.json and api.json.Parse and Decode(Encode(_tData)) or _tData or {}
     table.insert(s.tLoopIn, {sKind = "packet", nType = _nType, sFile = nil, tData = tMirror})
@@ -226,15 +227,15 @@ Bridge.SendPacket = function(_nType, _sFile, _tData)
     for k, v in pairs(_tData or {}) do
       tMirror[k] = v
     end
-    -- p = 1: the packet is about the "friend's" copy, which sits on the other side of the mirror.
-    if type(tMirror.x) == "number" then
+    -- Area, water & terrain packets: the receiver applies the shift itself from ox, so x is left alone
+    -- (shifting both put mirrored aquarium water 100 m away, where it was refused).
+    if _nType == 0x22 or _nType == 0x23 then
+      tMirror.ox = c_nLoopOffsetCm
+    elseif type(tMirror.x) == "number" then
+      -- p = 1: the packet is about the "friend's" copy, which sits on the other side of the mirror.
       tMirror.x = tMirror.x + (tMirror.p == 1 and -c_nLoopOffsetCm or c_nLoopOffsetCm)
     end
     tMirror.p = nil
-    -- Area & terrain packets carry nested positions: the receiver applies the shift itself.
-    if _nType == 0x22 or _nType == 0x23 then
-      tMirror.ox = c_nLoopOffsetCm
-    end
     table.insert(s.tLoopIn, {sKind = "packet", nType = _nType,
       sFile = _sFile and (c_sEnginePrefix .. _sFile) or nil, tData = tMirror})
     Bridge.Log("loopback: mirrored packet type " .. _nType .. " (" .. s.nLoopCount .. "/" .. c_nLoopLimit .. ")")
@@ -310,6 +311,14 @@ end
 
 Bridge.GetVersionMismatch = function()
   return s.sVersionMismatch
+end
+
+Bridge.GetCachedPeerAvatar = function()
+  return s.tPeerAvatar
+end
+
+Bridge.ClearCachedPeerAvatar = function()
+  s.tPeerAvatar = nil
 end
 
 Bridge.IsApplying = function()
@@ -509,6 +518,7 @@ local TrackSession = function(_tEvent)
     s.bPeerConnected = true
   elseif sEvent == "peer_disconnected" then
     s.bPeerConnected = false
+    s.tPeerAvatar = nil
     s.sVersionMismatch = nil
     s.sHostMode = nil
     s.sHostScenario = nil
@@ -520,6 +530,7 @@ local TrackSession = function(_tEvent)
   elseif sEvent == "left" then
     s.bLoopback = false
     s.bPeerConnected = false
+    s.tPeerAvatar = nil
     s.sRole = "none"
     s.sVersionMismatch = nil
     s.sHostMode = nil
@@ -622,6 +633,10 @@ Bridge.Pump = function(_nDeltaTime)
       else
         s.sVersionMismatch = nil
       end
+    elseif tMsg.nType == c_nPresenceAvatar and type(tMsg.tData) == "table" and tMsg.tData.k == nil and type(tMsg.tData.group) == "string" then
+      -- Cache the peer's avatar look across environment transitions (main menu join, park load, resync)
+      -- so the host's player model is never lost while the guest is loading the zoo.
+      s.tPeerAvatar = tMsg.tData
     elseif tMsg.nType == c_nSaveLoadCommit and s.sRole == "client" then
       local tZoo = Session().tZoo or {nGot = 0, nTotal = 0, nBytes = 0}
       tZoo.bReceived = true

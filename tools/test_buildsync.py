@@ -25,21 +25,55 @@ for _, name in ipairs({"EditExistingPart", "EditExistingParts", "DestroyExisting
 end
 hierarchyMT.GetFullUndoChangeList = function() return {} end
 hierarchyMT.CreateCompositeObject = function() return {Destroy = function() end, GetOBB = function() return nil end,
+  GetFlattenTerrainToggleState = function() return 2 end,
   SetCompositeOriginToOBBCentre = function() end, SetTransform = function() end} end
 hierarchyMT.IsLoadedBlueprintReadyForEditing = function() return true end
 hierarchyMT.AddBlueprintToCompositeObject = function() end
+hierarchyMT.SetPerformTerrainModificationsModifyVolumes = function(_, b) terrainEdits = b end
 local tWorldAPIs = {
   scenery_group = {
     TryGetBuildingGroupForPart = function() return nil end,
     CalculateBuildingGroupAABB = function() error("not a group") end,
   },
   placement = {GetPartResourceName = function(_, id) return parts[id] and parts[id].name end},
-  scenery_puppets = {PlacementIDToEntityID = function(_, id) return parts[id] and id + 1000 end},
-  transform = {CalculateWorldTransform = function(_, e) return {GetPos = function() return parts[e - 1000].pos end,
-    GetOr = function() return {ToYawPitchRoll = function() return vec(1.5, 0, 0) end} end} end},
+  scenery_puppets = {
+    PlacementIDToEntityID = function(_, id) return parts[id] and id + 1000 end,
+    EntityIDToPlacementID = function(_, e) return (e and parts[e - 1000]) and (e - 1000) or nil end,
+  },
+  spatial = {
+    Flag_Scenery = 2,
+    Flag_Enrichment = 16,
+    SphereQuery = function(_, vPos, nRadius)
+      local hits = {}
+      for id, p in pairs(parts) do
+        local dx = p.pos:GetX() - vPos:GetX()
+        local dy = p.pos:GetY() - vPos:GetY()
+        local dz = p.pos:GetZ() - vPos:GetZ()
+        if dx*dx + dy*dy + dz*dz <= nRadius*nRadius then
+          table.insert(hits, id + 1000)
+        end
+      end
+      return hits
+    end,
+  },
+  transform = {
+    CalculateWorldTransform = function(_, e)
+      local p = parts[e - 1000]
+      if not p then return nil end
+      return {GetPos = function() return p.pos end,
+        GetOr = function() return {ToYawPitchRoll = function() return vec(1.5, 0, 0) end} end}
+    end,
+    GetParent = function() return nil end,
+  },
   worldserialisation = {CreateSaveSelection = function() return {AddEntityID = function() end} end},
   scenery = {AddSceneryToBlueprintSelection = function() end, AddGroupToBlueprintSelection = function() end},
-  editors = {CreateUndoOperationsHierarchy = function() return setmetatable({}, hierarchyMT) end},
+  editors = {
+    CreateUndoOperationsHierarchy = function() return setmetatable({}, hierarchyMT) end,
+    FlattenTerrain_LockedNeverFlatten = 1, TerrainActionType_PathJoinPartFlatten = 3, TerrainActionType_None = 0,
+    SetTerrainActionOnMoveObject = function(_, _, nAction) terrainAction = nAction end,
+    GetIsTutorialActive = function() return tutorialActive end,
+    SetIsTutorialActive = function(_, b) tutorialActive = b end,
+  },
   facilities = {GetAllHabitatsEntityIDs = function() return {} end},
   habitat = {GetHabitatIDFromEntityID = function() end},
   habitatboundary = {GetBoundaryObjectsForHabitat = function() end},
@@ -49,12 +83,16 @@ local tWorldAPIs = {
 }
 editorBusy = false
 editorRuns = 0
+tutorialActive = false
+tutorialActiveDuringEditorRun = nil
+editorRefuse = false
 editMode = {
   HasRequestedChange = function() return editorBusy end,
   RequestUndoOperation = function(_, fn, _, post)
     editorRuns = editorRuns + 1
     fn(setmetatable({}, hierarchyMT))
-    if post then post() end
+    tutorialActiveDuringEditorRun = tutorialActive
+    if not editorRefuse and post then post() end
     return true
   end,
 }
@@ -67,6 +105,7 @@ api = {
     CancelPreview = function() return token end, Checkpoint = function() end, ClearHistory = function() end,
     GetCommitFailReasons = function() return {} end,
     IsPreviewingChangeList = function() return previewing end, IsBusy = function() return false end,
+    CanUndo = function() return false end, CanRedo = function() return false end,
   },
   messaging = setmetatable({
     RegisterReceiver = function(n, fn) receivers[n] = fn end, UnregisterReceiver = function() end,
@@ -79,6 +118,7 @@ local Bridge = {
   IsApplying = function() return Bridge_applying end,
   BeginApply = function() Bridge_applying = true end, EndApply = function() Bridge_applying = false end,
   GetPrefix = function() return "/run/PZ2Coop/" end,
+  GetRole = function() return "host" end,
   SendPacket = function(n, f, d) table.insert(packets, {n = n, f = f, d = d}) end,
 }
 Bridge_applying = false
@@ -89,6 +129,9 @@ local stubs = {
   Quaternion = {FromYawPitchRoll = function(v) return {ypr = v} end},
   ["PZ2Coop.Bridge"] = Bridge,
   ["Editors.Shared.BaseEditMode"] = {GetModeHelperEntity = function() return 1 end},
+  -- the HUD greys out undo/redo (and Ctrl+Z) from api.undo.CanUndo/CanRedo (windows.mainhud.lua:1792)
+  ["Windows.MainHUD"] = {RequestUndoRedo = function() end,
+    UpdateDisplay = function() hudCanUndo, hudCanRedo = api.undo.CanUndo(), api.undo.CanRedo() end},
   ["Editors.Scenery.SceneryEditHelper"] = {
     Yielding_CreateNewPart_Scenery = function(_, name)
       created = {name = name}
@@ -152,6 +195,12 @@ assert(packets[nBefore + 2].n == 0x20 and packets[nBefore + 2].d.yaw == 1500, "r
 assert(created and created.name == "Feeder_AquaticStation_Fish", "redo did not re-create the part locally")
 assert(has("undo: undo of 1 change(s): 1 done") and has("undo: redo of 1 change(s): 1 done"), table.concat(log, "\n"))
 assert(BuildSync.HandleUndoRedo(false) == true and has("undo: nothing to redo"), "empty redo not handled")
+-- remote applies clear the game's history; the HUD must still offer undo from our own journal (1 entry now),
+-- while editor code outside the HUD keeps seeing the game's real answer
+local MainHUD = require("Windows.MainHUD")
+MainHUD.UpdateDisplay(MainHUD)
+assert(hudCanUndo == true and hudCanRedo == false, "HUD undo not enabled from the journal")
+assert(api.undo.CanUndo() == false, "CanUndo override leaked outside the HUD")
 -- a friend's building arrives while this player holds an item (live preview): it goes through the
 -- player's editor at once instead of waiting until the item is put down
 previewing = true
@@ -161,10 +210,51 @@ for _ = 1, 10 do BuildSync.Update(0.1, true) end
 assert(editorRuns == nRuns + 1 and has("group handed to the active editor"),
   "building did not go through the editor while previewing:\n" .. table.concat(log, "\n"))
 assert(not has("remote action waits: player is previewing a change"), "building waited for the preview")
+assert(terrainEdits == true, "remote building placed with terrain edits off (no ground flatten/paint)")
+assert(terrainAction == 3, "remote building skipped the vanilla flatten/join terrain action (got " .. tostring(terrainAction) .. ")")
 previewing = false
 assert(not has("job failed"), "a job failed:\n" .. table.concat(log, "\n"))
+-- Pre-existing save parts (never seen in s.tSeen) are discovered via spatial:SphereQuery on remote delete
+parts[777] = {name = "pl_gutter_01_straight_2m", pos = vec(52.18, 0.17, 121.16)}
+tutorialActive = true
+local nDesBefore = #destroyed
+BuildSync.OnPacket({nType = 0x21, tData = {h = 0, x = 5218, y = 17, z = 12116, r = 250, k = "p", n = "pl_gutter_01_straight_2m"}})
+for _ = 1, 10 do BuildSync.Update(0.1, true) end
+assert(#destroyed == nDesBefore + 1 and destroyed[#destroyed] == 777,
+  "pre-existing save part not found/deleted via spatial query:\n" .. table.concat(log, "\n"))
+assert(tutorialActiveDuringEditorRun == false and tutorialActive == true,
+  "tutorial restriction must be suspended during remote apply and restored after")
+-- Batch Demolish (DestroyExistingParts with a BuildingPartSet) captures ALL parts via GetPartIDCollection()
+parts[801] = {name = "pl_barrel_01", pos = vec(53.95, -0.01, 125.48)}
+parts[802] = {name = "pl_spade", pos = vec(55.59, -0.03, 126.60)}
+parts[803] = {name = "pl_rope_02_pile", pos = vec(52.86, -0.01, 123.45)}
+local fakePartSet = {
+  GetPartIDCollection = function() return {801, 802, 803} end,
+  GetOnePartID = function() return 801 end,
+}
+local clh = tWorldAPIs.editors:CreateUndoOperationsHierarchy()
+clh:DestroyExistingParts(fakePartSet)
+parts[801], parts[802], parts[803] = nil, nil, nil
+local nPktsBeforeBatch = #packets
+receivers.MsgType_PlacementPartCommittedMessage({
+  {nPlacementPartID = 801}, {nPlacementPartID = 802}, {nPlacementPartID = 803},
+})
+BuildSync.Update(0.1, true)
+assert(#packets == nPktsBeforeBatch + 3,
+  "batch demolish should send all 3 deleted parts, got " .. tostring(#packets - nPktsBeforeBatch))
+-- Refused editor commit exits promptly (within 3 ticks) instead of blocking for 30 s
+editorRefuse = true
+BuildSync.OnPacket({nType = 0x20, tData = {x = 6000, y = 200, z = 3000, k = "p", n = "HB_Nest_WaterPlatform_Large", yaw = 0, pitch = 0, roll = 0}})
+-- It first waits 1 s after the batch demolish commit above (c_nAfterLocalCommit: a remote part handed over
+-- mid-commit crashed the engine), then must exit within a few ticks
+for _ = 1, 5 do BuildSync.Update(0.1, true) end
+assert(not has("refused by the active editor"), "remote editor op ran right after the player's own commit")
+for _ = 1, 10 do BuildSync.Update(0.1, true) end
+editorRefuse = false
+assert(has("refused by the active editor"), "refused editor op did not exit promptly:\n" .. table.concat(log, "\n"))
+assert(tutorialActive == true and not Bridge.IsApplying(), "guards leaked after refused editor commit")
 local summary = BuildSync.Summary()
-assert(string.find(summary, "parts seen=1", 1, true), "summary wrong: " .. summary)
+assert(string.find(summary, "parts seen=4", 1, true), "summary wrong: " .. summary)
 return "ok: " .. summary
 """
 

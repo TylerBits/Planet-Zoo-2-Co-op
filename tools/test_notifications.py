@@ -39,7 +39,8 @@ api = {
   game = {GetEnvironment = function() return tEnv end},
 }
 local noopSync = {Install = function() end, Uninstall = function() end, Update = function() end,
-  ResetSnapshot = function() end, OnPacket = function() return false end, Summary = function() return "" end}
+  ResetSnapshot = function() end, OnPacket = function() return false end, OnPeerConnected = function() end,
+  Summary = function() return "" end}
 local stubs = {
   ["Environment.ModuleMutators"] = {Manager = function() return function(m) return m end end},
   ["PZ2Coop.BuildSync"] = noopSync,
@@ -49,10 +50,14 @@ local stubs = {
   ["PZ2Coop.StaffSync"] = noopSync,
   ["PZ2Coop.AnimalSync"] = noopSync,
   ["PZ2Coop.ResearchSync"] = noopSync,
+  ["PZ2Coop.CareerSync"] = noopSync,
   ["PZ2Coop.Presence"] = {Install = function() end, Shutdown = function() end, Update = function() end,
     Reset = function() end, OnPacket = function() return false end},
   ["PZ2Coop.Actions"] = {Install = function() end, Uninstall = function() end, Update = function() end,
     Reset = function() end, OnPacket = function() return false end},
+  ["PZ2Coop.Vehicles"] = {Install = function() end, Uninstall = function() end, Update = function() end,
+    Reset = function() end, OnPacket = function() return false end, OnPeerConnected = function() end,
+    OnPeerDisconnected = function() end},
   ["PZ2Coop.SaveGuard"] = {Install = function() end, OnParkStart = function() end,
     SyncAutosaveState = function() end, Shutdown = function() end},
 }

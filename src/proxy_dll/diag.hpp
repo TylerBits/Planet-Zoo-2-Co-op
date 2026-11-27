@@ -16,7 +16,8 @@ void installDiagnostics();
 void startDiagnosticScan();
 // Appends one line to diag.log (thread-safe). Used by the DLL and, via {"cmd":"diag"}, by Lua.
 void diagLog(std::string_view text);
-// Points PlanetZoo2.exe's import of <dll>!<function> at hook; returns the original, or nullptr if not imported.
-void* patchExeImport(const char* dll, const char* function, void* hook);
+// Points PlanetZoo2.exe's import of <dll>!<function> at hook. original (if still null) is set to the old target
+// BEFORE the slot is switched, so a game thread entering the hook mid-patch never sees null. Stays null if not imported.
+void patchExeImport(const char* dll, const char* function, void* hook, void*& original);
 
 } // namespace pz2

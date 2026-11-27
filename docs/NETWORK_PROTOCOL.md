@@ -1,11 +1,11 @@
 # Wire Protocol & Steamworks P2P Specification (`docs/NETWORK_PROTOCOL.md`)
 
 ## 0. Status
-Protocol `kProtocolVersion = 0x02`. No packet has crossed two real PCs yet (loopback only). Feature claims: `docs/HANDOFF.md`.
+Protocol `kProtocolVersion = 0x02`. Core packets (`0x02`/`0x03`, `0x11`, `0x20`, `0x21`, `0x22` paths) crossed two real PCs on 2026-11-25; newer sync modules are offline-tested / solo-verified. Feature claims: `docs/HANDOFF.md`.
 
 | Tag | Packets |
 |---|---|
-| `[IMPLEMENTED]` | `0x01` hello (mod version + host game mode `Sandbox`/`Challenge`), `0x02`/`0x03` save transfer (**with LZ4 `kFlagLz4` block compression**), `0x11` ledger (cash + game speed + time of day), `0x20` place (groups, loose parts), `0x21` delete, `0x22` area sync (paths + water add/remove), **`0x23` terrain strokes** (batched brush dabs: push/pull, flatten, chisel, smooth, roughen, terrace, gradient, attract, curl, sharpen, paint, autopaint), **`0x30` staff hire/fire, exhibit add/remove, habitat animal contraceptive/remove, & research tier unlocks**, **`0x31` habitat animal waypoints/SyncUUID sync**, `0x10` presence (camera pose + walk mode), `0x12` presence avatar + **whitelisted player actions (`k = "action"`: emotes, props, sitting, world interactions, hold hands)** |
+| `[IMPLEMENTED]` | `0x01` hello (mod version + host game mode `Sandbox`/`Challenge`), `0x02`/`0x03` save transfer (**with LZ4 `kFlagLz4` block compression**), `0x11` ledger (cash + game speed + time of day), `0x20` place (groups, loose parts), `0x21` delete, `0x22` area sync (paths + water add/remove), **`0x23` terrain strokes** (batched brush dabs: push/pull, flatten, chisel, smooth, roughen, terrace, gradient, attract, curl, sharpen, paint, autopaint), **`0x30` staff hire/fire, exhibit add/remove, habitat animal contraceptive/remove, & research tier unlocks**, **`0x31` habitat animal waypoints/SyncUUID sync**, `0x10` presence (camera pose + walk mode), `0x12` presence avatar + **whitelisted player actions (`k = "action"`: emotes, props, sitting, world interactions)** + **4-seat vehicle events (`k = "vehicle"`: seat/swap, headlights, recall, respawn)**, **`0x13` 20 Hz driver vehicle pose (`VEHICLE_POSE_20HZ`)** |
 | `[OFF]` | `0x22` fence payloads: sent, but receiver ignores them (`c_bApplyFences`) |
 | `[PLANNED]` | Conservation credits setter (no engine API found) |
 
@@ -17,8 +17,8 @@ written only to fixed names (`rx_<n>.bin`, `rx_save.bin`) in `<game>\PZ2Coop\`.
 
 | Virtual Channel | Send Flags | Purpose | Max Frequency |
 | :--- | :--- | :--- | :--- |
-| **Channel 0 (Reliable)** | `k_nSteamNetworkingSend_Reliable` | Save handshake, group/scenery place+delete, path area sync. `[PLANNED]` terrain, animal/staff actions. | Event-driven |
-| **Channel 1 (Unreliable)** | `k_nSteamNetworkingSend_UnreliableNoNagle` | 1Hz host ledger, 10Hz presence (`0x10`). `[PLANNED]` 10Hz animal waypoints. | 20 Hz |
+| **Channel 0 (Reliable)** | `k_nSteamNetworkingSend_Reliable` | Save handshake, group/scenery place+delete, path/water area sync, terrain strokes, animal/staff/research/avatar/action/vehicle events. | Event-driven |
+| **Channel 1 (Unreliable)** | `k_nSteamNetworkingSend_UnreliableNoNagle` | 1 Hz host ledger (`0x11`), 20 Hz presence (`0x10`), 20 Hz vehicle pose (`0x13`), 10 Hz animal waypoints (`0x31`). | 20 Hz |
 
 ## 2. Room Code Encoding (Base62 `CSteamID`)
 To allow effortless joining without manual IP configuration:
@@ -37,6 +37,8 @@ enum class PacketType : uint8_t {
     SAVE_LOAD_COMMIT      = 0x03,
     CURSOR_TRANSFORM_20HZ = 0x10,
     LEDGER_SYNC_1HZ       = 0x11,
+    PRESENCE_AVATAR       = 0x12,
+    VEHICLE_POSE_20HZ     = 0x13,
     ACTION_PLACE_OBJECT   = 0x20,
     ACTION_DELETE_SPATIAL = 0x21,
     ACTION_PATH_STAMP     = 0x22,
@@ -47,7 +49,7 @@ enum class PacketType : uint8_t {
 
 struct PacketHeader {
     uint32_t   magic;          // Always 0x505A3243 ('PZ2C')
-    uint8_t    version;        // Protocol version (0x01)
+    uint8_t    version;        // Protocol version (0x02)
     PacketType type;           // PacketType enum
     uint16_t   flags;          // Bit 0: LZ4 Compressed
     uint32_t   sequence;       // Monotonic packet sequence number
@@ -59,10 +61,10 @@ struct PacketHeader {
 
 ## 4. Core Payload Schemas
 
-### `CURSOR_TRANSFORM_20HZ` (Channel 1 — 32 Bytes) `[IMPLEMENTED]` presence
-Sent by `src/ovl_mod/pz2coop.presence.lua` every 0.1 s while a role is set and a peer (or solo mirror) exists.
-Lua JSON keys `cx,cy,cz,px,py,pz,yaw,m` (metres / radians). The DLL keeps only the newest per 50 ms tick.
-A 28-byte payload from an older DLL fails the size check and is dropped (no other packet is affected).
+### `CURSOR_TRANSFORM_20HZ` (Channel 1 — 36 Bytes) `[IMPLEMENTED]` presence
+Sent by `src/ovl_mod/pz2coop.presence.lua` every 0.05 s (20 Hz) while a role is set and a peer (or solo mirror) exists.
+Lua JSON keys `cx,cy,cz,px,py,pz,yaw,m,pitch` (metres / radians; `pitch` optional on send, defaults to `0`). The DLL keeps only the newest per 50 ms tick.
+A 32-byte payload from an older DLL fails the size check and is dropped (no other packet is affected).
 
 ```cpp
 struct CursorTransformPayload {
@@ -70,6 +72,7 @@ struct CursorTransformPayload {
     float cursor_pos[3];   // ground point: feet while walking, orbit centre while flying
     float cursor_yaw;      // camera yaw in radians (vCameraYPR:X())
     float mode;            // 0 = flying build camera, 1 = walking first person, 2 = walking third person
+    float cursor_pitch;    // camera pitch in radians (vCameraYPR:Y(); negative = up, positive = down)
 };
 
 ```
@@ -79,7 +82,14 @@ Sent once per connection (and in loopback mirror mode) by `src/ovl_mod/pz2coop.p
 sanitized `tAvatar` (`version`, `group`, `actor`, `voice`, `variant`, `skin`, `parts`, `items.Hats`). The receiver
 validates every field as a trust boundary (no paths or dots, bounded sizes, JSON `"1".."4"` colour keys normalized
 to integer keys) and renders the friend with the vehicle-driver recipe (`StartScreenAvatar:Create(..., "friend", "Static")`)
-while walking.
+while walking. Also multiplexes reliable player activity events (`k = "action"`) and 4-seat Research Vehicle state
+events (`k = "vehicle"`, `op = "seat" | "lights" | "recall" | "respawn"`).
+
+### `VEHICLE_POSE_20HZ` `0x13` (Channel 1 — Unreliable JSON) `[IMPLEMENTED]` (offline-tested)
+Sent by `src/ovl_mod/pz2coop.vehicles.lua` at 20 Hz while the local player occupies Seat 1 (Driver) of the Research
+Vehicle: `{k = "vpose", x, y, z, yaw, pitch, roll, spd, steer}`. Non-driving peers validate finite bounds, ignore if
+they are currently driving, and smoothly interpolate the vehicle's world transform while locking seated passenger avatars
+to their calibrated seat anchors.
 
 ### `ACTION_DELETE_SPATIAL` (Channel 0 — JSON, protocol v2)
 Protocol v1 packed this as a fixed 24-byte struct (asset hash, x/y/z cm, radius mm), which silently dropped
@@ -94,8 +104,10 @@ sent position (or of the shared position it recorded when it placed the copy); p
 
 ### `ACTION_PATH_STAMP` 0x22 — area replace for paths `[IMPLEMENTED]` and fences `[OFF]` (Channel 0 — JSON + optional blueprint)
 `{k = "path" | "fence", x0,y0,z0,x1,y1,z1 = changed area (cm)}` plus
-- path: `n` = path volume chunks now in the area (0 = area emptied), `cx,cy,cz` = centre of their AABB (cm),
-  attachment = blueprint holding those chunks;
+- path: `n` = path volume chunks now in the area (every chunk touching the change, plus every chunk lying
+  inside the grown area: the receiver replaces all of its own chunks inside the area) (0 = area emptied), `cx,cy,cz` = centre of their AABB (cm),
+  `by0` = bottom of their pieces (cm), `wp = 1` = place the blueprint where it was saved (it keeps the sender's
+  world position; receivers without `wp` re-target it to `cx,cy,cz`), attachment = blueprint holding those chunks;
 - fence: `posts`, `panels` = every connected fence touching the area as `GetAllData()` tables
   `{f = plain fields, v = {name = [x,y,z] metres}, r = {name = post index}}`, local IDs stripped.
 The receiver removes its own paths / fences in the area and places / rebuilds the sent content

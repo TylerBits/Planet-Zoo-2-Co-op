@@ -17,7 +17,8 @@ enum class PacketType : std::uint8_t {
     SAVE_LOAD_COMMIT = 0x03,
     CURSOR_TRANSFORM_20HZ = 0x10,
     LEDGER_SYNC_1HZ = 0x11,
-    PRESENCE_AVATAR = 0x12, // JSON avatar look (guest prefab + multipart props), once per connection
+    PRESENCE_AVATAR = 0x12, // JSON avatar look, actions (k="action"), & reliable vehicle events (k="vehicle")
+    VEHICLE_POSE_20HZ = 0x13, // Unreliable 20 Hz JSON vehicle transform, speed, & steering from active driver
     ACTION_PLACE_OBJECT = 0x20,
     ACTION_DELETE_SPATIAL = 0x21,
     ACTION_PATH_STAMP = 0x22,
@@ -40,6 +41,7 @@ struct CursorTransformPayload {
     float cursor_pos[3];
     float cursor_yaw;
     float mode; // 0 = flying build camera, 1 = walking first person, 2 = walking third person
+    float cursor_pitch; // camera pitch in radians (vCameraYPR:Y(); negative = up, positive = down)
 };
 
 struct LedgerSyncPayload {
@@ -51,7 +53,7 @@ struct LedgerSyncPayload {
 #pragma pack(pop)
 
 static_assert(sizeof(PacketHeader) == 16);
-static_assert(sizeof(CursorTransformPayload) == 32);
+static_assert(sizeof(CursorTransformPayload) == 36);
 static_assert(sizeof(LedgerSyncPayload) == 20);
 
 inline constexpr std::uint32_t kPacketMagic = 0x505A3243; // 'PZ2C'
@@ -69,6 +71,7 @@ constexpr bool isKnownPacketType(std::uint8_t t) {
     case PacketType::CURSOR_TRANSFORM_20HZ:
     case PacketType::LEDGER_SYNC_1HZ:
     case PacketType::PRESENCE_AVATAR:
+    case PacketType::VEHICLE_POSE_20HZ:
     case PacketType::ACTION_PLACE_OBJECT:
     case PacketType::ACTION_DELETE_SPATIAL:
     case PacketType::ACTION_PATH_STAMP:
@@ -83,7 +86,7 @@ constexpr bool isKnownPacketType(std::uint8_t t) {
 // Channel 1 (unreliable, coalesced to 20 Hz). Everything else is Channel 0 (reliable).
 constexpr bool isUnreliable(PacketType t) {
     return t == PacketType::CURSOR_TRANSFORM_20HZ || t == PacketType::LEDGER_SYNC_1HZ ||
-           t == PacketType::ANIMAL_WAYPOINT_10HZ;
+           t == PacketType::VEHICLE_POSE_20HZ || t == PacketType::ANIMAL_WAYPOINT_10HZ;
 }
 
 // Only the host may originate these (host-authoritative save + ledger).

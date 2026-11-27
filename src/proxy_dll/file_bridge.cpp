@@ -188,7 +188,7 @@ std::optional<std::vector<std::uint8_t>> packFixed(PacketType type, std::string_
     switch (type) {
     case PacketType::CURSOR_TRANSFORM_20HZ: {
         constexpr const char* keys[] = {"cx", "cy", "cz", "px", "py", "pz", "yaw", "m"};
-        float values[8] = {};
+        float values[9] = {};
         for (std::size_t i = 0; i < 8; ++i) {
             const auto v = num(keys[i]);
             if (!v || !inRange(*v, -1e7, 1e7)) {
@@ -198,6 +198,15 @@ std::optional<std::vector<std::uint8_t>> packFixed(PacketType type, std::string_
         }
         if (values[7] < 0 || values[7] > 2) {
             return std::nullopt;
+        }
+        // Optional pitch (radians, negative = up, positive = down); defaults to 0 when omitted.
+        if (const auto p = num("pitch")) {
+            if (!inRange(*p, -4.0, 4.0)) {
+                return std::nullopt;
+            }
+            values[8] = static_cast<float>(*p);
+        } else {
+            values[8] = 0.0f;
         }
         CursorTransformPayload payload{};
         static_assert(sizeof(values) == sizeof(payload));
@@ -232,20 +241,21 @@ std::string unpackFixed(PacketType type, const std::uint8_t* payload, std::size_
     switch (type) {
     case PacketType::CURSOR_TRANSFORM_20HZ: {
         const auto c = get<CursorTransformPayload>(payload);
-        const float values[8] = {c.cam_pos[0], c.cam_pos[1], c.cam_pos[2], c.cursor_pos[0],
-                                 c.cursor_pos[1], c.cursor_pos[2], c.cursor_yaw, c.mode};
+        const float values[9] = {c.cam_pos[0], c.cam_pos[1], c.cam_pos[2], c.cursor_pos[0],
+                                 c.cursor_pos[1], c.cursor_pos[2], c.cursor_yaw, c.mode, c.cursor_pitch};
         for (const float v : values) {
             if (!std::isfinite(v)) {
                 return {};
             }
         }
-        if (values[7] < 0 || values[7] > 2) {
+        if (values[7] < 0 || values[7] > 2 || values[8] < -4.0f || values[8] > 4.0f) {
             return {};
         }
-        std::snprintf(buf, sizeof(buf),
-                      R"({"cx":%.9g,"cy":%.9g,"cz":%.9g,"px":%.9g,"py":%.9g,"pz":%.9g,"yaw":%.9g,"m":%.9g})",
-                      double{values[0]}, double{values[1]}, double{values[2]}, double{values[3]}, double{values[4]},
-                      double{values[5]}, double{values[6]}, double{values[7]});
+        std::snprintf(
+            buf, sizeof(buf),
+            R"({"cx":%.9g,"cy":%.9g,"cz":%.9g,"px":%.9g,"py":%.9g,"pz":%.9g,"yaw":%.9g,"m":%.9g,"pitch":%.9g})",
+            double{values[0]}, double{values[1]}, double{values[2]}, double{values[3]}, double{values[4]},
+            double{values[5]}, double{values[6]}, double{values[7]}, double{values[8]});
         return buf;
     }
     case PacketType::LEDGER_SYNC_1HZ: {

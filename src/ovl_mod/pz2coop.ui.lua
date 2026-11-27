@@ -100,6 +100,11 @@ local GetActions = function()
   return bOk and type(Actions) == "table" and Actions or nil
 end
 
+local GetVehicles = function()
+  local bOk, Vehicles = pcall(require, "PZ2Coop.Vehicles")
+  return bOk and type(Vehicles) == "table" and Vehicles or nil
+end
+
 local GetSaveGuard = function()
   local bOk, SaveGuard = pcall(require, "PZ2Coop.SaveGuard")
   return bOk and type(SaveGuard) == "table" and SaveGuard or nil
@@ -236,6 +241,13 @@ local c_tCommands = {
     local Actions = GetActions()
     if Actions ~= nil then
       Actions.SetWheelOpen(false)
+    end
+  end,
+  -- Research Vehicle recall command from the Co-op Esc menu (pz2coop.vehicles.lua).
+  vrecall = function(_sArg)
+    local Vehicles = GetVehicles()
+    if Vehicles ~= nil and Vehicles.QueueUICommand ~= nil then
+      Vehicles.QueueUICommand("vrecall", _sArg)
     end
   end,
 }
@@ -401,8 +413,10 @@ local BuildState = function()
   end
   local tZoo = tSession.tZoo
   local Presence = GetPresence()
+  local Vehicles = GetVehicles()
   return {
     friendPose = Presence ~= nil and Presence.HasFriend() or nil,
+    hasVehicle = Vehicles ~= nil and Vehicles.HasVehicle ~= nil and Vehicles.HasVehicle() or nil,
     allowed = Bridge.IsSyncedPark(),
     canJoin = CanJoin(),
     role = sRole,

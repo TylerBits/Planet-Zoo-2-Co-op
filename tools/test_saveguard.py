@@ -97,10 +97,15 @@ local EventActionRequestAutosave = {
   end,
 }
 
+local BackgroundWorldDataManager = {
+  SetupHUDForReturnToStartScreen = function(self) note("SetupHUDForReturnToStartScreen") end,
+}
+
 local tEnv = {
   RequestInterface = function(_, name)
     if name == "Interfaces.IParkLoadSaveManager" then return ParkLoadSaveManager end
     if name == "Interfaces.INotificationManager" then return notificationManager end
+    if name == "Interfaces.IBackgroundWorldDataManager" then return BackgroundWorldDataManager end
     return nil
   end,
   RequireInterface = function(_, name)
@@ -142,6 +147,7 @@ local stubs = {
   ["Windows.MainHUD"] = MainHUD,
   ["Events.EventActionRequestAutosave"] = EventActionRequestAutosave,
   ["Events.Event"] = SuperEvent,
+  ["Managers.BackgroundWorldDataManager"] = BackgroundWorldDataManager,
 }
 local loaded = {}
 require = function(name)
@@ -258,6 +264,19 @@ __PZ2CoopBridgeState.sRole = "none"
 ParkLoadSaveManager:LoadParkFromSaveToken("local_save_token")
 assert(not Bridge.IsGuestWorld() and not SaveGuard.IsSuspended() and resumeCount == 2,
   "loading local save must clear guest-world lock and resume autosave")
+
+-- 7. Host leaving world to main menu / quitting closes the co-op room immediately while preserving host save
+__PZ2CoopBridgeState.sRole = "host"
+Bridge.SetGuestWorld(false)
+local nCmdsBefore = #cmds
+SaveAgent:OnPauseMenu_ReturnToStartScreen(nil, false, true)
+assert(#cmds == nCmdsBefore + 1 and cmds[#cmds] == "leave", "host exit to menu must send leave")
+assert(lastExitArgs.suppress == false and lastExitArgs.shot == true, "host exit must still allow saving host zoo")
+SaveAgent:OnPauseMenu_QuitGame(nil, false, true)
+assert(#cmds == nCmdsBefore + 2 and cmds[#cmds] == "leave", "host quit must send leave")
+assert(lastQuitArgs.suppress == false and lastQuitArgs.shot == true, "host quit must still allow saving host zoo")
+BackgroundWorldDataManager:SetupHUDForReturnToStartScreen()
+assert(#cmds == nCmdsBefore + 3 and cmds[#cmds] == "leave", "host SetupHUDForReturnToStartScreen must send leave")
 
 return "ok: saveguard"
 """

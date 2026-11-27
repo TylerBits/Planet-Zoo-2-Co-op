@@ -58,6 +58,8 @@ UI_PATCHES = {
     "js/project/modules/Frontend/HomeButtons.js": "homebuttons_patch.js",
     "js/project/modules/PauseMenu/PauseMenu.js": "pausemenu_patch.js",
     "js/project/modules/PauseMenu/PauseMenuModule.js": "pausemenumodule_patch.js",
+    "js/project/data/Schemas/BrowserItemsDatabase.js": "browseritemsdatabase_patch.js",
+    "js/project/modules/Browser/BrowserUtils.js": "browserutils_patch.js",
 }
 # Our own UI files (new paths, nothing shadowed).
 UI_NEW_FILES = {

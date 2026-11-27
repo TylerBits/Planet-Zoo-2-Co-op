@@ -25,8 +25,10 @@ local TerrainSync = require("PZ2Coop.TerrainSync")
 local StaffSync = require("PZ2Coop.StaffSync")
 local AnimalSync = require("PZ2Coop.AnimalSync")
 local ResearchSync = require("PZ2Coop.ResearchSync")
+local CareerSync = require("PZ2Coop.CareerSync")
 local Presence = require("PZ2Coop.Presence")
 local Actions = require("PZ2Coop.Actions")
+local Vehicles = require("PZ2Coop.Vehicles")
 local SaveGuard = require("PZ2Coop.SaveGuard")
 
 local PZ2CoopManager = module(..., (Mutators.Manager)())
@@ -86,16 +88,22 @@ PZ2CoopManager.Init = function(self, _tProperties, _tEnvironment)
   self.bIsWildArea = false
   self.nLastAppliedSpeed = nil
   self.bMismatchNotified = false
+  self.nAutoBaselineTimer = nil
+  self.nReturnToMenuTimer = nil
 end
 
 PZ2CoopManager.Shutdown = function(self)
   Bridge.SetHandler(nil)
+  self.nAutoBaselineTimer = nil
+  self.nReturnToMenuTimer = nil
   for nType, fnReceiver in pairs(self.tReceivers) do
     api.messaging.UnregisterReceiver(nType, fnReceiver)
   end
   self.tReceivers = {}
+  Vehicles.Uninstall()
   Actions.Uninstall()
   Presence.Shutdown()
+  CareerSync.Uninstall()
   ResearchSync.Uninstall()
   AnimalSync.Uninstall()
   StaffSync.Uninstall()
@@ -192,9 +200,16 @@ PZ2CoopManager._Start = function(self)
   StaffSync.Install()
   AnimalSync.Install()
   ResearchSync.Install()
+  CareerSync.Install(self.tEnvironment)
   Presence.Install()
   Actions.Install()
+  Vehicles.Install()
   self:_RegisterProbes()
+  -- Host switched to a new park (e.g. next Career campaign zoo from the Conservation Map) while a peer is
+  -- still connected: re-send handshake metadata + baseline save once the new park settles so the friend follows.
+  if Bridge.GetRole() == "host" and Bridge.IsPeerConnected() then
+    self.nAutoBaselineTimer = 1.5
+  end
   Bridge.Log("park manager started (" .. sMode ..
     (self.sScenarioCode and (" scenario=" .. self.sScenarioCode) or "") ..
     (self.bIsWildArea and " wild=true" or "") ..
@@ -220,6 +235,7 @@ PZ2CoopManager.ParkReset = function(self)
   StaffSync.ResetSnapshot()
   AnimalSync.ResetSnapshot()
   ResearchSync.ResetSnapshot()
+  CareerSync.ResetSnapshot()
 end
 
 PZ2CoopManager.WorldLoad = function(self, _tLoad, _nLoadedVersion)
@@ -230,8 +246,10 @@ PZ2CoopManager.WorldLoad = function(self, _tLoad, _nLoadedVersion)
   StaffSync.ResetSnapshot()
   AnimalSync.ResetSnapshot()
   ResearchSync.ResetSnapshot()
+  CareerSync.ResetSnapshot()
   Presence.Reset()
   Actions.Reset()
+  Vehicles.Reset()
 end
 
 -- Errors inside environment phases are otherwise invisible in retail; each distinct one is logged once.
@@ -284,8 +302,34 @@ PZ2CoopManager._Advance = function(self)
   StaffSync.Update(nDt, Bridge.GetRole() ~= "none")
   AnimalSync.Update(nDt, Bridge.GetRole() ~= "none")
   ResearchSync.Update(nDt, Bridge.GetRole() ~= "none")
+  CareerSync.Update(nDt, Bridge.GetRole() ~= "none")
   Presence.Update(nDt, Bridge.GetRole() ~= "none")
   Actions.Update(nDt, Bridge.GetRole() ~= "none")
+  Vehicles.Update(nDt, Bridge.GetRole() ~= "none")
+  if self.nAutoBaselineTimer ~= nil then
+    if Bridge.GetRole() ~= "host" or not Bridge.IsPeerConnected() then
+      self.nAutoBaselineTimer = nil
+    else
+      self.nAutoBaselineTimer = self.nAutoBaselineTimer - nDt
+      if self.nAutoBaselineTimer <= 0 then
+        self.nAutoBaselineTimer = nil
+        Bridge.Log("host switched park while connected: sending handshake + baseline to friend")
+        self:_SendHandshakeHello()
+        self:_SendBaseline()
+      end
+    end
+  end
+  if self.nReturnToMenuTimer ~= nil then
+    if not Bridge.IsGuestWorld() or Bridge.IsLoopback() or Bridge.IsStartScreenActive() then
+      self.nReturnToMenuTimer = nil
+    else
+      self.nReturnToMenuTimer = self.nReturnToMenuTimer - nDt
+      if self.nReturnToMenuTimer <= 0 then
+        self.nReturnToMenuTimer = nil
+        self:_ReturnGuestToStartScreen()
+      end
+    end
+  end
   -- Solo test (Co-op menu "Test join"): the baseline is saved and looped back as if a friend had joined.
   if Bridge.TakeTestJoin() then
     Bridge.Log("test join: saving this zoo as the baseline a joining friend would receive")
@@ -323,6 +367,62 @@ PZ2CoopManager._Notify = function(self, _sText, _sColour)
   end)
 end
 
+PZ2CoopManager._SendHandshakeHello = function(self)
+  Bridge.SendPacket(c_nHandshakeHello, nil, {
+    mode = self.sGameMode,
+    scenario = self.sScenarioCode,
+    diff = self.sGameDifficulty,
+    wild = self.bIsWildArea == true,
+    ver = Bridge.GetModVersion and Bridge.GetModVersion() or "0.3.0",
+  })
+end
+
+PZ2CoopManager._ScheduleReturnToMenu = function(self, _nDelaySecs, _sReason)
+  if self.nReturnToMenuTimer ~= nil then
+    return
+  end
+  self.nReturnToMenuTimer = _nDelaySecs or 2.0
+  Bridge.Log("guest world disconnect (" .. tostring(_sReason) .. "): returning to main menu in " ..
+    tostring(self.nReturnToMenuTimer) .. " s")
+end
+
+-- Returns a disconnected guest to the Start Screen without saving the host's zoo.
+PZ2CoopManager._ReturnGuestToStartScreen = function(self)
+  if not Bridge.IsGuestWorld() or Bridge.IsLoopback() or Bridge.IsStartScreenActive() then
+    return
+  end
+  Bridge.Log("returning guest to start screen (host left world)")
+  local bTriggered = false
+  pcall(function()
+    local worldScript = api.world and api.world.GetActive and api.world.GetScript and api.world.GetScript(api.world.GetActive())
+    local mainHUD = worldScript and worldScript.GetHUD and worldScript:GetHUD()
+    local saveAgent = mainHUD and mainHUD.saveAgent
+    if saveAgent ~= nil and saveAgent.OnPauseMenu_ReturnToStartScreen ~= nil then
+      saveAgent:OnPauseMenu_ReturnToStartScreen(mainHUD, true, false)
+      bTriggered = true
+    end
+  end)
+  if not bTriggered then
+    pcall(function()
+      local tGameEnv = api.game and api.game.GetEnvironment and api.game.GetEnvironment()
+      local bg = tGameEnv and tGameEnv.RequestInterface and tGameEnv:RequestInterface("Interfaces.IBackgroundWorldDataManager")
+      if bg ~= nil and bg.SetupHUDForReturnToStartScreen ~= nil then
+        bg:SetupHUDForReturnToStartScreen()
+      end
+      if api.game ~= nil and api.game.RequestReturnToStart ~= nil then
+        api.game.RequestReturnToStart()
+        bTriggered = true
+      elseif api.world ~= nil and api.world.Activate ~= nil then
+        api.world.Activate("StartScreenGlobe", false)
+        bTriggered = true
+      end
+    end)
+  end
+  if not bTriggered then
+    Bridge.Log("could not automatically return guest to start screen (no SaveAgent or RequestReturnToStart)")
+  end
+end
+
 PZ2CoopManager._OnSessionEvent = function(self, _tEvent)
   local sEvent = _tEvent.event
   local tSession = Bridge.GetSession()
@@ -332,14 +432,11 @@ PZ2CoopManager._OnSessionEvent = function(self, _tEvent)
   if sEvent == "peer_connected" then
     self.bMismatchNotified = false
     self.nLastAppliedSpeed = nil
+    self.nReturnToMenuTimer = nil
     local sName = self.sLastPartner
-    Bridge.SendPacket(c_nHandshakeHello, nil, {
-      mode = self.sGameMode,
-      scenario = self.sScenarioCode,
-      diff = self.sGameDifficulty,
-      wild = self.bIsWildArea == true,
-      ver = Bridge.GetModVersion and Bridge.GetModVersion() or "0.3.0",
-    })
+    self:_SendHandshakeHello()
+    CareerSync.OnPeerConnected()
+    Vehicles.OnPeerConnected()
     SaveGuard.SyncAutosaveState()
     if Bridge.GetRole() == "host" then
       self:_Notify((sName or "A friend") .. " joined your zoo", "Green")
@@ -348,13 +445,20 @@ PZ2CoopManager._OnSessionEvent = function(self, _tEvent)
       self:_Notify(sName and ("Connected to " .. sName .. "'s zoo") or "Connected to host's zoo", "Green")
     end
   elseif sEvent == "peer_disconnected" then
+    Vehicles.OnPeerDisconnected()
     local sName = self.sLastPartner or "Your friend"
     self.sLastPartner = nil
     self.nLastAppliedSpeed = nil
     self.bMismatchNotified = false
     SaveGuard.SyncAutosaveState()
-    self:_Notify(sName .. " left the co-op session", "Red")
+    if Bridge.IsGuestWorld() and not Bridge.IsLoopback() then
+      self:_Notify("Host left the co-op session — returning to main menu", "Red")
+      self:_ScheduleReturnToMenu(2.0, "host disconnected")
+    else
+      self:_Notify(sName .. " left the co-op session", "Red")
+    end
   elseif sEvent == "left" then
+    Vehicles.OnPeerDisconnected()
     self.sLastPartner = nil
     self.nLastAppliedSpeed = nil
     self.bMismatchNotified = false
@@ -362,7 +466,14 @@ PZ2CoopManager._OnSessionEvent = function(self, _tEvent)
   elseif sEvent == "error" then
     local sCode = tostring(_tEvent.code)
     if sCode == "connection_lost" then
-      self:_Notify("Connection to host lost", "Red")
+      if Bridge.IsGuestWorld() and not Bridge.IsLoopback() then
+        if self.nReturnToMenuTimer == nil then
+          self:_Notify("Connection to host lost — returning to main menu", "Red")
+          self:_ScheduleReturnToMenu(2.0, "connection lost")
+        end
+      else
+        self:_Notify("Connection to host lost", "Red")
+      end
     elseif sCode == "connect_failed" then
       self:_Notify("Could not connect to host", "Red")
     elseif sCode == "zoo_transfer_failed" then
@@ -388,6 +499,8 @@ PZ2CoopManager._OnMessage = function(self, _tMsg)
     self:_LoadBaseline(_tMsg.sFile)
   elseif _tMsg.nType == c_nLedgerSync then
     self:_ApplyLedger(_tMsg.tData)
+  elseif Vehicles.OnPacket(_tMsg) then
+    return
   elseif Presence.OnPacket(_tMsg) then
     return
   elseif Actions.OnPacket(_tMsg) then
@@ -399,6 +512,8 @@ PZ2CoopManager._OnMessage = function(self, _tMsg)
   elseif StaffSync.OnPacket(_tMsg) then
     return
   elseif ResearchSync.OnPacket(_tMsg) then
+    return
+  elseif CareerSync.OnPacket(_tMsg) then
     return
   elseif AnimalSync.OnPacket(_tMsg) then
     return

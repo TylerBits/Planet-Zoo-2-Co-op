@@ -132,6 +132,7 @@ export const EmoteWheel = Focusable.decorate(class EmoteWheel extends preact.Com
 
     componentWillMount() {
         bindDSPropsToState(this, UI_CONTEXT, this._dataHelper, 'pz2coopEmoteWheel');
+        this._dataHelper.addPropertyListener(UI_CONTEXT, 'pz2coopExploreUI', this._onExploreUIState);
         this._dataHelper.getAllPropertiesNow();
     }
 
@@ -162,10 +163,26 @@ export const EmoteWheel = Focusable.decorate(class EmoteWheel extends preact.Com
 
     componentWillUnmount() {
         this._setActive(false);
+        this._setExploreUIClass('idle');
         this._dataHelper.clear();
         this._visibleControlContext?.destroy();
         this._visibleControlContext = null;
         this._logicalStick = null;
+    }
+
+    _onExploreUIState = (mode) => {
+        this._setExploreUIClass(mode);
+    };
+
+    _setExploreUIClass(mode) {
+        if (typeof document === 'undefined' || !document.body || !document.body.classList) {
+            return;
+        }
+        const cl = document.body.classList;
+        cl.remove('pz2coop-explore-ui-entering', 'pz2coop-explore-ui-visible', 'pz2coop-explore-ui-exiting');
+        if (mode === 'entering' || mode === 'visible' || mode === 'exiting') {
+            cl.add(`pz2coop-explore-ui-${mode}`);
+        }
     }
 
     _setActive(active) {

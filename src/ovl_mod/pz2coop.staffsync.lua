@@ -473,8 +473,13 @@ StaffSync.Update = function(_nDt, _bSending)
   local bInPlaceTool = BuildSync.GetTool() == "StaffMovement"
   local tReady = {}
   for nEntityID, tPend in pairs(s.tPending) do
-    if tPend.bCommitted or (not bInPlaceTool and s.nClock - tPend.nSince >= 0.25) then
-      table.insert(tReady, nEntityID)
+    local bTimeOk = tPend.bCommitted or (not bInPlaceTool and s.nClock - tPend.nSince >= 0.25)
+    if bTimeOk then
+      local sx, sy, sz = StaffPosCm(nEntityID)
+      -- Wait for a real world position (avoid sending unplaced 0,0,0 ghosts); after 2 s emit anyway.
+      if (sx ~= nil and (sx ~= 0 or sy ~= 0 or sz ~= 0)) or (s.nClock - tPend.nSince >= 2.0) then
+        table.insert(tReady, nEntityID)
+      end
     end
   end
   for _, nEntityID in ipairs(tReady) do

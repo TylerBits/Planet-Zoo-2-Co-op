@@ -86,7 +86,8 @@ def static_archive(ovl: bytes, oodle_dll: Path | None = None) -> tuple[dict, byt
     return arc, data
 
 
-def find_ppuipkg_files(arc: dict, data: bytes, paths: list[str]) -> dict[str, bytes]:
+def find_ppuipkg_files(arc: dict, data: bytes, paths: list[str] | None) -> dict[str, bytes]:
+    # paths=None returns every UIGameface/ file (used by extract_ui_textures.py).
     """ppuipkg file entries are {file_name ptr, file_size u64, file_content ptr}; pointers are fragments
     (link pool/offset -> struct pool/offset). A fragment whose target is one of our path strings is a
     file_name slot, so its file's size and content follow it."""
@@ -101,12 +102,16 @@ def find_ppuipkg_files(arc: dict, data: bytes, paths: list[str]) -> dict[str, by
         pool_start.append(pos)
         pos += u32(data, pools_hdr + i * 32 + 8)
     links = {}
-    wanted = {("UIGameface/" + p).encode() + b"\0": p for p in paths}
+    wanted = {("UIGameface/" + p).encode() + b"\0": p for p in paths or ()}
     names = []
     for i in range(arc["num_fragments"]):
         lp, lo, sp, so = struct.unpack_from("<iIiI", data, frags_at + i * 16)
         links[(lp, lo)] = (sp, so)
         at = pool_start[sp] + so
+        if paths is None:
+            if data[at:at + 11] == b"UIGameface/":
+                names.append((data[at + 11:data.index(b"\0", at)].decode(), lp, lo))
+            continue
         for key, path in wanted.items():
             if data[at:at + len(key)] == key:
                 names.append((path, lp, lo))

@@ -11,3 +11,39 @@
 .PZ2CoopEmoteWheel_root .RadialMenu_headerSubLabel {
   opacity: 0.85;
 }
+
+
+/* Explore UI fade-in + slight move-up ease-out after camera transition, and reverse on exit. */
+body.pz2coop-explore-ui-entering .Radar_root {
+  opacity: 0;
+  transform: translateX(-50%) translateY(1.0rem);
+}
+
+body.pz2coop-explore-ui-entering .HUD_promptsListContainer {
+  opacity: 0;
+  transform: translateY(1.0rem);
+}
+
+body.pz2coop-explore-ui-visible .Radar_root {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+  transition: opacity 0.38s cubic-bezier(0.22, 1, 0.36, 1), transform 0.38s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+body.pz2coop-explore-ui-visible .HUD_promptsListContainer {
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity 0.38s cubic-bezier(0.22, 1, 0.36, 1), transform 0.38s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+body.pz2coop-explore-ui-exiting .Radar_root {
+  opacity: 0;
+  transform: translateX(-50%) translateY(1.0rem);
+  transition: opacity 0.25s cubic-bezier(0.4, 0, 1, 1), transform 0.25s cubic-bezier(0.4, 0, 1, 1);
+}
+
+body.pz2coop-explore-ui-exiting .HUD_promptsListContainer {
+  opacity: 0;
+  transform: translateY(1.0rem);
+  transition: opacity 0.25s cubic-bezier(0.4, 0, 1, 1), transform 0.25s cubic-bezier(0.4, 0, 1, 1);
+}

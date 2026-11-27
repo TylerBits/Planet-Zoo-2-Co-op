@@ -74,7 +74,15 @@ local tWorldAPIs = {
   },
   scenery_group = {TryGetBuildingGroupForPart = function() end, CalculateBuildingGroupAABB = function() end},
   placement = {GetPartResourceName = function() end},
-  facilities = {GetAllHabitatsEntityIDs = function() return {} end},
+  facilities = {
+    GetAllHabitatsEntityIDs = function() return {801} end,
+    CreateAnimalInHabitatAtTransform = function(_, nHab, nG, nAge, sSp, tr)
+      call("CreateAnimalInHabitat", nHab, sSp, nG, nAge, tr.pos:GetX(), tr.pos:GetZ())
+      habitatAnimals[702] = {species = sSp, contra = false, pos = tr.pos}
+      return {animalEntityID = 702}
+    end,
+  },
+  habitat = {GetHabitatContainingPoint = function(_, vPos) return 801 end},
   editors = {CreateUndoOperationsHierarchy = function() return {} end},
 }
 local receivers = {}
@@ -104,8 +112,9 @@ local Bridge = {
 }
 local stubs = {
   Vector3 = {new = function(_, x, y, z) return vec(x, y, z) end},
-  TransformQ = {},
-  Quaternion = {},
+  TransformQ = {Identity = {WithPos = function(_, v) return {pos = v} end},
+    FromOrPos = function(q, v) return {pos = v, q = q} end},
+  Quaternion = {Identity = {}},
   ["PZ2Coop.Bridge"] = Bridge,
   ["Editors.Scenery.SceneryEditHelper"] = {},
 }
@@ -191,6 +200,25 @@ assert(count("SetUsingContraceptive") == 1 and habitatAnimals[701].contra == tru
 assert(AnimalSync.OnPacket({nType = 0x30, tData = {k = "animal", op = "remove", id = "lion_sync_1", s = "African_Lion", x = 1500, y = 0, z = 2500}}) == true)
 tick(4)
 assert(count("RemoveAnimal") == 1 and habitatAnimals[701] == nil, "habitat animal remove not applied")
+
+-- 7) habitat animal add (outgoing detection + incoming spawn via CreateAnimalInHabitatAtTransform)
+packets, calls = {}, {}
+habitatAnimals[705] = {species = "Leopard_African", contra = false, pos = vec(25, 1, 35)}
+tick(25)
+local addPkt = nil
+for _, pkt in ipairs(packets) do
+  if pkt.n == 0x30 and pkt.d.k == "animal" and pkt.d.op == "add" then addPkt = pkt end
+end
+assert(addPkt ~= nil and addPkt.d.s == "Leopard_African" and addPkt.d.x == 2500,
+  "local habitat animal add not broadcast:\n" .. dump())
+calls = {}
+assert(AnimalSync.OnPacket({nType = 0x30, tData = {k = "animal", op = "add", id = "Leopard_African_9",
+  s = "Leopard_African", g = 1, age = 1, x = 3000, y = 100, z = 4000}}) == true)
+tick(6)
+assert(count("CreateAnimalInHabitat") == 1, "remote habitat animal not spawned:\n" .. dump())
+local sc = lastCall("CreateAnimalInHabitat")
+assert(sc.args[1] == 801 and sc.args[2] == "Leopard_African" and sc.args[5] == 30 and sc.args[6] == 40,
+  "wrong CreateAnimalInHabitat args")
 
 assert(not has("error") and not has("failed"), dump())
 return "ok: animal sync"

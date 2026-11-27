@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract and decompile Planet Zoo 2 Lua scripts (docs/LUA_EXTRACTION_GUIDE.md).
+"""Extract and decompile Planet Zoo 2 Lua scripts (see docs/LUA_API_MAP.md §0).
 
 Pipeline:
   1. Find <PZ2>/Win64/ovldata (Steam auto-detect or --game-dir). Missing/incomplete install -> exit 0.

@@ -35,9 +35,11 @@ MODULE_FILES = {
     "PZ2Coop.StaffSync": "pz2coop.staffsync.lua",
     "PZ2Coop.AnimalSync": "pz2coop.animalsync.lua",
     "PZ2Coop.ResearchSync": "pz2coop.researchsync.lua",
+    "PZ2Coop.CareerSync": "pz2coop.careersync.lua",
     "PZ2Coop.Avatar": "pz2coop.avatar.lua",
     "PZ2Coop.Presence": "pz2coop.presence.lua",
     "PZ2Coop.Actions": "pz2coop.actions.lua",
+    "PZ2Coop.Vehicles": "pz2coop.vehicles.lua",
     "PZ2Coop.SaveGuard": "pz2coop.saveguard.lua",
     "Managers.PZ2CoopManager": "managers.pz2coopmanager.lua",
 }
@@ -99,6 +101,7 @@ state = {
   hidden = {},
   autosaveSuspended = false,
   autosaveCleared = 0,
+  returnedToStart = 0,
 }
 
 local receivers = {}
@@ -225,6 +228,12 @@ local mainHUD = {
     if nIdx ~= nil then state.simSpeedIdx = nIdx end
     call("ChangeSimulationSpeedSettings", state.simPaused, state.simSpeedIdx)
   end,
+  saveAgent = {
+    OnPauseMenu_ReturnToStartScreen = function(_, _, bSuppress, bShot)
+      state.returnedToStart = state.returnedToStart + 1
+      call("ReturnToStartScreen", bSuppress, bShot)
+    end,
+  },
 }
 local tEnv = {
   RequestInterface = function(_, name)
@@ -628,7 +637,18 @@ def main() -> int:
     dlc_blocked = make_peer("client", "AF", mode="ScenarioCareer", scenario="DLC_01", dlc_blocked=True)
     assert dlc_blocked.globals().Bridge.IsSyncedPark() is False, "DLC-blocked scenario must not be synced"
 
-    print("ok: two-peer E2E (handshake, scenarios, saveguard, speed+ToD, resync, avatars 0x12, water 0x22, staff 0x30, notifications, Franchise lockout)")
+    # 8. Host leaves career world -> guest receives disconnect and automatically returns to start screen without saving
+    sc_guest.globals().deliverEvent(py_to_lua(sc_guest, {"event": "peer_disconnected"}))
+    sc_guest.globals().tick(25)  # > 2.0 s return-to-menu timer
+    assert sc_guest.globals().state["returnedToStart"] == 1, (
+        f"guest stayed stuck in host career world after host left: {sc_guest.globals().state['returnedToStart']}"
+    )
+    sc_g_calls = lua_to_py(sc_guest.globals().calls)
+    assert any(c["name"] == "ReturnToStartScreen" and c["args"] == [True, False] for c in sc_g_calls), (
+        f"guest return to start screen must suppress save: {sc_g_calls}"
+    )
+
+    print("ok: two-peer E2E (handshake, scenarios, saveguard, host-exit kick, speed+ToD, resync, avatars 0x12, water 0x22, staff 0x30, notifications, Franchise lockout)")
     return 0
 
 

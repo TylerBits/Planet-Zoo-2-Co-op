@@ -20,6 +20,7 @@
 --            is shifted after preview so its new pieces sit on the sender's content centre.
 -- Packet 0x22 (ACTION_PATH_STAMP, JSON + optional blueprint): {k = "path"|"fence", x0..z1 = area (cm),
 --   n = chunks / habitats now there (0 = area emptied), cx,cy,cz = content AABB centre (cm)}.
+--   wp = 1: place the blueprint where it was saved (receivers without it re-target to cx/cy/cz).
 -- ox (cm, solo loopback only): the receiver shifts everything this far along x.
 local global = _G
 local api = global.api
@@ -57,6 +58,8 @@ local c_nLogLimit = 400
 -- Receiving fences is ON: the 2026-11-12 freezes were caused by Unpack() adding loopback ox (+50 m) to unit
 -- direction vectors (vDir / vDirStart / vDirEnd) and missing vanilla boundary volume/LakesInLimbo setup.
 local c_bApplyFences = global.rawget(global, "PZ2COOP_TEST_FENCES") ~= false
+-- Open-fence rebuilds run inside the open fence tool (live), not after it closes. Untested live: kill switch.
+local c_bLiveFences = global.rawget(global, "PZ2COOP_LIVE_FENCES") ~= false
 
 local s = {
   bInstalled = false,
@@ -66,7 +69,7 @@ local s = {
   bSettled = false,
   nClock = 0,
   nStartedAt = 0,
-  nIgnoreUntil = -1,
+  tIgnore = {}, -- {r = area (m), nUntil}: changes there come from a remote apply, not the player
   bSending = false,
   fnReceiver = nil,
   fnHabReceiver = nil,
@@ -169,6 +172,28 @@ local Centre = function(_t)
   return {x = Cm((_t.x0 + _t.x1) / 2), y = Cm((_t.y0 + _t.y1) / 2), z = Cm((_t.z0 + _t.z1) / 2)}
 end
 
+-- Echo suppression by area: only changes overlapping a just-applied remote area are dropped, so the player's
+-- own next stroke elsewhere is still sent (a global 1.5 s window lost half a path circle, diag.log 2026-11-27).
+local c_nIgnoreMarginM = 5 -- the engine re-joins neighbouring chunks a little past the applied area
+local IgnoreArea = function(_r)
+  table.insert(s.tIgnore, {r = Expand(_r, c_nIgnoreMarginM), nUntil = s.nClock + c_nIgnoreAfterApply})
+end
+
+local IsIgnored = function(_tBox)
+  if _tBox == nil then
+    return false
+  end
+  for i = #s.tIgnore, 1, -1 do
+    local t = s.tIgnore[i]
+    if s.nClock >= t.nUntil then
+      table.remove(s.tIgnore, i)
+    elseif Overlaps(_tBox, t.r) then
+      return true
+    end
+  end
+  return false
+end
+
 -- ---- spatial query ---------------------------------------------------------------------------------------
 -- Hits with _nFlag inside the region: each raw hit plus its owner resolved the way the demolish brush does.
 local QueryHits = function(_r, _nFlag)
@@ -180,6 +205,14 @@ local QueryHits = function(_r, _nFlag)
   local pih = tWorldAPIs.PlayerInteractionHandler
   local tPairs = {}
   for _, nHit in ipairs(tHits) do
+    -- The cylinder circles the box, so its rim reaches past the box corners (into the solo mirror copy).
+    local tHitBox = ShapeBox(nHit)
+    if tHitBox == nil or Overlaps(tHitBox, _r) then
+      table.insert(tPairs, {nRaw = nHit})
+    end
+  end
+  for _, tPair in ipairs(tPairs) do
+    local nHit = tPair.nRaw
     local nOwner = nHit
     pcall(function()
       if pih:HasParentEntityID(nOwner) then
@@ -189,7 +222,7 @@ local QueryHits = function(_r, _nFlag)
         nOwner = tWorldAPIs.transform:GetParent(nOwner) or nOwner
       end
     end)
-    table.insert(tPairs, {nRaw = nHit, nOwner = nOwner})
+    tPair.nOwner = nOwner
   end
   return tPairs
 end
@@ -252,13 +285,24 @@ end
 
 -- Path volume chunks in the region, in an editors multi-selection (the container vanilla saves and deletes
 -- from), their union box and each chunk's box (from the raw hit, which has the spatial shape).
-local QueryPathChunks = function(_r)
+-- _rInside (receiver only): skip chunks reaching more than c_nInsideTolM outside it. Deleting a whole chunk
+-- that sticks out of the area removes path the sender never re-sent (the "disconnected path" after a delete).
+local c_nInsideTolM = 1.0
+local c_nWholeChunkM = 20 -- shortcut: chunks longer than this past the area edge look smaller; raise if paths still break
+local Inside = function(_a, _b)
+  return _a.x0 >= _b.x0 and _a.x1 <= _b.x1 and _a.z0 >= _b.z0 and _a.z1 <= _b.z1
+end
+
+local QueryPathChunks = function(_r, _rInside)
   local tWorldAPIs = api.world.GetWorldAPIs()
   local volumes = tWorldAPIs.volumes
-  local tPairs = QueryHits(_r, s.tFlags.path)
+  -- Look wider, so each chunk's whole extent is known from all its hits, not only those inside.
+  local tPairs = QueryHits(Expand(_r, c_nWholeChunkM), s.tFlags.path)
   local ms = tWorldAPIs.editors:CreateMultiSelection()
   ms:SetCanSelectPathVolumeChunks(true)
   local tBoxByChunk = {}
+  local tWholeByChunk = {}
+  local tOrder = {}
   local tHow = {}
   local tMiss = nil
   local nOutside = 0
@@ -266,10 +310,13 @@ local QueryPathChunks = function(_r)
     local nChunk, sHow, tTried = ChunkOf(ms, volumes, tPair)
     if nChunk ~= nil then
       local tBox = ShapeBox(tPair.nRaw) or ShapeBox(nChunk)
+      if tBox ~= nil then
+        tWholeByChunk[nChunk] = BoxUnion(tWholeByChunk[nChunk], tBox)
+      end
       if tBox == nil or Overlaps(tBox, _r) then
         tHow[sHow] = (tHow[sHow] or 0) + 1
         if tBoxByChunk[nChunk] == nil then
-          pcall(function() ms:AddEntity(nChunk) end)
+          table.insert(tOrder, nChunk)
           tBoxByChunk[nChunk] = tBox or false
         else
           tBoxByChunk[nChunk] = BoxUnion(tBoxByChunk[nChunk] or nil, tBox) or false
@@ -281,12 +328,52 @@ local QueryPathChunks = function(_r)
       tMiss = tTried
     end
   end
+  if _rInside == nil then
+    -- Sender: also send every chunk lying inside the grown area, until no more fit. The receiver replaces all
+    -- its chunks inside that area; one the sender left out (it did not touch the change box) was deleted
+    -- there and never came back: the gaps in a freshly drawn loop (play test 2026-11-27 14:56).
+    local rArea = _r
+    for _, nChunk in ipairs(tOrder) do
+      rArea = BoxUnion(rArea, tWholeByChunk[nChunk] or tBoxByChunk[nChunk] or nil)
+    end
+    local nAdded, bGrew, nPass = 0, true, 0
+    while bGrew and nPass < 5 do
+      bGrew, nPass = false, nPass + 1
+      local rFit = Expand(rArea, c_nInsideTolM)
+      for nChunk, tWhole in pairs(tWholeByChunk) do
+        if tBoxByChunk[nChunk] == nil and Inside(tWhole, rFit) then
+          table.insert(tOrder, nChunk)
+          tBoxByChunk[nChunk] = tWhole
+          rArea = BoxUnion(rArea, tWhole)
+          nAdded, bGrew = nAdded + 1, true
+        end
+      end
+    end
+    if nAdded > 0 then
+      Log("path query: added " .. nAdded .. " chunk(s) lying inside the area")
+    end
+  end
+  local rTol = _rInside and Expand(_rInside, c_nInsideTolM) or nil
+  local nKept = 0
+  for _, nChunk in ipairs(tOrder) do
+    local tWhole = tWholeByChunk[nChunk] or ShapeBox(nChunk)
+    if rTol ~= nil and tWhole ~= nil and not Inside(tWhole, rTol) then
+      nKept = nKept + 1
+    else
+      pcall(function() ms:AddEntity(nChunk) end)
+    end
+  end
+  if nKept > 0 then
+    Log("path query: kept " .. nKept .. " own chunk(s) reaching outside the area")
+  end
   local tChunks, tBox = {}, nil
   local nCount = ms:CountCategory(ms.SelectionCategory_PathVolumeChunks) or 0
   for i = 1, nCount do
     local nChunk = ms:GetPathVolumeChunkEntity(i)
     table.insert(tChunks, nChunk)
-    local tChunkBox = tBoxByChunk[nChunk] or ShapeBox(nChunk)
+    -- Piece boxes (raw hits) first: the chunk entity's own box reaches ~83 cm below the pieces, and a by0
+    -- taken from it seated every mirrored path 83 cm low (autotest mirror_place, 2026-11-27).
+    local tChunkBox = tWholeByChunk[nChunk] or tBoxByChunk[nChunk] or ShapeBox(nChunk) or nil
     tBoxByChunk[nChunk] = tChunkBox or false
     tBox = BoxUnion(tBox, tChunkBox or nil)
   end
@@ -480,12 +567,18 @@ local PrepareHierarchy = function(_h)
 end
 
 -- Exact vanilla HabitatBoundaryEditMode._CreateChangeListHierarchy + _HandleLakesInLimbo recipe
--- (editors.habitatboundary.habitatboundaryeditmode.lua:2323-2349).
+-- (editors.habitatboundary.habitatboundaryeditmode.lua:2323-2349). Uses CheckLakesMode_Off so aquarium
+-- water never blocks replacing glass/acrylic walls on the remote peer.
 local PrepareFenceHierarchy = function(_h)
   pcall(function()
     _h:SetBoundaryEditPreviewModeModifyVolumes(true)
   end)
-  PrepareHierarchy(_h)
+  local gameterrain = api.world.GetWorldAPIs().gameterrain
+  _h:SetPerformTerrainModificationsModifyVolumes(false)
+  local op = _h:GetTerrainEditOperation()
+  gameterrain:SetTerrainEditOpCollisionFlags(op, true, false, false, true, true,
+    gameterrain.CheckLakesMode_Off or 0, false)
+  gameterrain:SetTerrainEditOpGridRenderingEnabled(op, false)
 end
 
 local HandleLakesInLimbo = function(_h)
@@ -513,7 +606,7 @@ end
 
 -- Preview, optional adjust, optional vanilla pre-commit terrain step, commit; nil = undo system taken (the job
 -- is re-queued by BuildSync.QueueRemote).
-local Yielding_CommitRegion = function(_h, _fnAdjust, _bPlacement)
+local Yielding_CommitRegion = function(_h, _fnAdjust, _bPlacement, _moveObject)
   local undo = api.undo
   if not BuildSync.IsUndoFree() then
     BuildSync.RequestRetry()
@@ -530,10 +623,7 @@ local Yielding_CommitRegion = function(_h, _fnAdjust, _bPlacement)
     end
   end
   if _bPlacement then
-    -- SingleFeatureUndoablePlacementModeBase._OnTryCommitCheck
-    _h:BeginVolumeModificationsBlock()
-    _h:SetPerformTerrainModificationsModifyVolumes(true)
-    _h:EndVolumeModificationsBlock()
+    BuildSync.VanillaPlacementCommitStep(_h, _moveObject)
   end
   local bCanCommit = undo.CanCommitPreview(previewToken)
   while bCanCommit == nil do
@@ -568,9 +658,101 @@ local ParkLoadSaveManager = function()
   return api.game.GetEnvironment():RequireInterface("Interfaces.IParkLoadSaveManager")
 end
 
--- Loads a blueprint into _h, puts its OBB centre on the target and, after preview, shifts it so the new pieces
--- (hits of _nFlag in the area that are not in _tOld) are centred on the target, like the group drift fix.
-local Yielding_PlaceBlueprint = function(_h, _sFile, _tTargetCm, _r, _nFlag, _tOld)
+local ExpandY = function(_r, _nExtraY)
+  return {x0 = _r.x0, y0 = _r.y0 - _nExtraY, z0 = _r.z0, x1 = _r.x1, y1 = _r.y1 + _nExtraY, z1 = _r.z1}
+end
+
+local MoveObjectPos = function(_moveObject)
+  local bOk, vPos = pcall(function() return _moveObject:GetPosition() end)
+  if bOk and vPos ~= nil then
+    local x, y, z = Vec3(vPos)
+    if x ~= nil then
+      return x, y, z
+    end
+  end
+  local bTr, tr = pcall(function() return _moveObject:GetTransform() end)
+  if bTr and tr ~= nil then
+    local x, y, z = Vec3(tr:GetPos())
+    if x ~= nil then
+      return x, y, z
+    end
+  end
+  return nil
+end
+
+local MoveObjectBox = function(_moveObject)
+  local tBox = nil
+  pcall(function()
+    if _moveObject.GetControlPoint ~= nil then
+      local vBot = _moveObject:GetControlPoint(Vector3:new(0, -1, 0))
+      local vTop = _moveObject:GetControlPoint(Vector3:new(0, 1, 0))
+      local bx, by, bz = Vec3(vBot)
+      local tx, ty, tz = Vec3(vTop)
+      if bx ~= nil and tx ~= nil then
+        tBox = {
+          x0 = math.min(bx, tx), y0 = math.min(by, ty), z0 = math.min(bz, tz),
+          x1 = math.max(bx, tx), y1 = math.max(by, ty), z1 = math.max(bz, tz),
+        }
+      end
+    end
+  end)
+  return tBox
+end
+
+local SnapshotHabitatEntities = function()
+  local tOld = {}
+  pcall(function()
+    local fac = api.world.GetWorldAPIs().facilities
+    if fac ~= nil and fac.GetAllHabitatsEntityIDs ~= nil then
+      for _, nEnt in pairs(fac:GetAllHabitatsEntityIDs() or {}) do
+        tOld[nEnt] = true
+      end
+    end
+  end)
+  return tOld
+end
+
+local MeasureNewHabitatsBox = function(_tOldHabs)
+  local tBox = nil
+  pcall(function()
+    local tWorld = api.world.GetWorldAPIs()
+    local fac, hab = tWorld.facilities, tWorld.habitat
+    if fac == nil or hab == nil or fac.GetAllHabitatsEntityIDs == nil then
+      return
+    end
+    for _, nEnt in pairs(fac:GetAllHabitatsEntityIDs() or {}) do
+      if not _tOldHabs[nEnt] then
+        local bOk, nHabID = pcall(hab.GetHabitatIDFromEntityID, hab, nEnt)
+        if bOk and nHabID ~= nil then
+          tBox = BoxUnion(tBox, HabitatBoundaryBox(nHabID))
+        end
+      end
+    end
+  end)
+  return tBox
+end
+
+local MeasureNewFencePiecesBox = function(_r, _tOldRaw)
+  local tBox = nil
+  local tPosts, tPanels = QueryFencePieces(ExpandY(_r, 40))
+  for key, oPost in pairs(tPosts) do
+    local nEnt = EntityOf(oPost)
+    if nEnt == nil or not _tOldRaw[nEnt] then
+      tBox = BoxUnion(tBox, BoundaryObjectBox(oPost))
+    end
+  end
+  for key, oPanel in pairs(tPanels) do
+    local nEnt = EntityOf(oPanel)
+    if nEnt == nil or not _tOldRaw[nEnt] then
+      tBox = BoxUnion(tBox, BoundaryObjectBox(oPanel))
+    end
+  end
+  return tBox
+end
+
+-- Loads a blueprint into _h, aligns its bottom (or OBB centre) to the target so it never starts 4 m
+-- underground, and after preview measures the actual placed pieces/habitats to shift to 0 cm drift.
+local Yielding_PlaceBlueprint = function(_h, _sFile, _tTargetCm, _r, _nFlag, _tOld, _tOpts)
   local bOk, sError = ParkLoadSaveManager():LoadBlueprintFromFile(_sFile)
   if not bOk then
     Log("blueprint load failed: " .. tostring(sError))
@@ -582,30 +764,80 @@ local Yielding_PlaceBlueprint = function(_h, _sFile, _tTargetCm, _r, _nFlag, _tO
   local moveObject = _h:CreateCompositeObject({})
   _h:AddBlueprintToCompositeObject(moveObject)
   moveObject:SetCompositeOriginToOBBCentre()
-  local vTarget = Vector3:new(_tTargetCm.x / 100, _tTargetCm.y / 100, _tTargetCm.z / 100)
-  moveObject:SetTransform(TransformQ.Identity:WithPos(vTarget), {})
+  if _tTargetCm.bKeep then
+    -- A loaded blueprint sits where the sender saved it (OBB centre = sender's world spot, retail autotest
+    -- 2026-11-27). Keeping it is exact; the OBB/control-point re-targeting below landed paths +26/-83/-87 cm
+    -- off, and the re-place that fixed it left a flattened trench and stray chunks behind.
+    local px, py, pz = MoveObjectPos(moveObject)
+    if px == nil then
+      Log("blueprint has no position, cannot keep it")
+      return nil
+    end
+    moveObject:SetTransform(TransformQ.Identity:WithPos(Vector3:new(px + (_tTargetCm.ox or 0) / 100,
+      py + (_tTargetCm.dy or 0) / 100, pz)), {})
+    return function() end, moveObject
+  end
+  local nTargetX, nTargetY, nTargetZ = _tTargetCm.x / 100, _tTargetCm.y / 100, _tTargetCm.z / 100
+  moveObject:SetTransform(TransformQ.Identity:WithPos(Vector3:new(nTargetX, nTargetY, nTargetZ)), {})
+  -- Pre-preview vertical alignment: if sender sent exact base Y (by0) and moveObject exposes its bottom
+  -- control point, shift before preview so habitat walls/aquariums don't start buried underground.
+  if _tTargetCm.by0 ~= nil then
+    local tPreBox = MoveObjectBox(moveObject)
+    if tPreBox ~= nil then
+      local nPreDy = (_tTargetCm.by0 / 100) - tPreBox.y0
+      if math.abs(nPreDy) > 0.02 and math.abs(nPreDy) < 50.0 then
+        local px, py, pz = MoveObjectPos(moveObject)
+        if px ~= nil then
+          moveObject:SetTransform(TransformQ.Identity:WithPos(Vector3:new(px, py + nPreDy, pz)), {})
+        end
+      end
+    end
+  end
+  local fnMeasure = _tOpts and _tOpts.fnMeasure or nil
+  -- Second value: the move object, for the vanilla commit-check step (terrain flatten/join).
   return function()
     local tBox = nil
-    for _, tPair in ipairs(QueryHits(_r, _nFlag)) do
-      if not _tOld[tPair.nRaw] then
-        tBox = BoxUnion(tBox, ShapeBox(tPair.nRaw))
+    if fnMeasure ~= nil then
+      tBox = fnMeasure(moveObject)
+    end
+    if tBox == nil then
+      for _, tPair in ipairs(QueryHits(ExpandY(_r, 25), _nFlag)) do
+        if not _tOld[tPair.nRaw] then
+          tBox = BoxUnion(tBox, ShapeBox(tPair.nRaw))
+        end
       end
+    end
+    if tBox == nil then
+      tBox = MoveObjectBox(moveObject)
     end
     if tBox == nil then
       Log("drift check skipped (no new pieces visible in preview)")
       return
     end
     local tNow = Centre(tBox)
-    local dx, dy, dz = _tTargetCm.x - tNow.x, _tTargetCm.y - tNow.y, _tTargetCm.z - tNow.z
+    local dx = _tTargetCm.x - tNow.x
+    local dz = _tTargetCm.z - tNow.z
+    local dy
+    if _tTargetCm.by0 ~= nil then
+      dy = _tTargetCm.by0 - Cm(tBox.y0)
+    else
+      dy = _tTargetCm.y - tNow.y
+    end
     local nOff = math.sqrt(dx * dx + dy * dy + dz * dz)
     if nOff <= c_nDriftToleranceCm then
       Log(string.format("drift %d cm before commit, no correction needed", math.floor(nOff + 0.5)))
       return
     end
-    moveObject:SetTransform(TransformQ.Identity:WithPos(Vector3:new((_tTargetCm.x + dx) / 100,
-      (_tTargetCm.y + dy) / 100, (_tTargetCm.z + dz) / 100)), {})
-    Log(string.format("drift %d cm before commit, corrected", math.floor(nOff + 0.5)))
-  end
+    local px, py, pz = MoveObjectPos(moveObject)
+    if px ~= nil then
+      moveObject:SetTransform(TransformQ.Identity:WithPos(Vector3:new(px + dx / 100, py + dy / 100, pz + dz / 100)), {})
+    else
+      moveObject:SetTransform(TransformQ.Identity:WithPos(Vector3:new((_tTargetCm.x + dx) / 100,
+        (_tTargetCm.y + dy) / 100, (_tTargetCm.z + dz) / 100)), {})
+    end
+    Log(string.format("drift %d cm (dx=%d dy=%d dz=%d) before commit, corrected",
+      math.floor(nOff + 0.5), math.floor(dx + 0.5), math.floor(dy + 0.5), math.floor(dz + 0.5)))
+  end, moveObject
 end
 
 local RawSet = function(_r, _nFlag)
@@ -640,7 +872,8 @@ end
 local Job_SendPath = function(_r)
   BuildSync.Breadcrumb("path region " .. RegionText(_r) .. ": query")
   local _, tChunks, tBox = QueryPathChunks(_r)
-  local tData = RegionFields({k = "path", n = #tChunks}, _r)
+  -- The area grows to the whole sent chunks, so the receiver's matching chunks fall inside it.
+  local tData = RegionFields({k = "path", n = #tChunks}, BoxUnion(_r, tBox))
   local sFile = nil
   if #tChunks > 0 then
     BuildSync.Breadcrumb("path region: save " .. #tChunks .. " chunks")
@@ -656,6 +889,8 @@ local Job_SendPath = function(_r)
     end
     local c = Centre(tBox)
     tData.cx, tData.cy, tData.cz = c.x, c.y, c.z
+    tData.by0 = Cm(tBox.y0)
+    tData.wp = 1
   end
   BuildSync.Count("sent path region")
   BuildSync.JournalRegion("path")
@@ -819,6 +1054,7 @@ local Job_SendFence = function(_r)
     end
     local c = Centre(tBox)
     tData.cx, tData.cy, tData.cz = c.x, c.y, c.z
+    tData.by0 = Cm(tBox.y0)
   elseif nPieces > 0 then
     return SendFencePieces(_r, tPosts, tPanels)
   end
@@ -835,16 +1071,92 @@ local RegionFromData = function(_t)
   return {x0 = _t.x0 / 100, y0 = _t.y0 / 100, z0 = _t.z0 / 100, x1 = _t.x1 / 100, y1 = _t.y1 / 100, z1 = _t.z1 / 100}
 end
 
+-- wp = 1: the blueprint is placed where it was saved (+ ox, + the kdy height fix), not re-targeted to cx/cy/cz.
 local TargetOf = function(_tData)
-  return {x = _tData.cx + (_tData.ox or 0), y = _tData.cy, z = _tData.cz}
+  return {x = _tData.cx + (_tData.ox or 0), y = _tData.cy, z = _tData.cz, by0 = _tData.by0,
+    bKeep = _tData.wp == 1, ox = _tData.ox or 0, dy = _tData.kdy or 0}
 end
 
-local Job_ApplyPath = function(_sFile, _tData)
+-- Bottom of the path pieces that are new since tOld, minus the sender's bottom (cm); nil if none visible.
+local MeasurePathDy = function(_r, _tOld, _nBy0, _sRoute)
+  if _nBy0 == nil then
+    return nil
+  end
+  local tNew = nil
+  for _, tPair in ipairs(QueryHits(ExpandY(_r, 25), s.tFlags.path)) do
+    if not _tOld[tPair.nRaw] then
+      tNew = BoxUnion(tNew, ShapeBox(tPair.nRaw))
+    end
+  end
+  if tNew == nil then
+    return nil
+  end
+  local nDy = Cm(tNew.y0) - _nBy0
+  s.nLastPathDy = nDy
+  Log(string.format("MEASURE path route=%s bottom=%d sender=%d dy=%d", _sRoute, Cm(tNew.y0), _nBy0, nDy))
+  return nDy
+end
+
+local Job_ApplyPath
+
+-- The preview drift check cannot see where path pieces really land: it read 0 cm while the commit put them
+-- a fixed, blueprint-specific offset off (+26 / -83 cm, autotest mirror_place 2026-11-27). So measure after
+-- the commit and re-place once with the target shifted by that offset; it is constant, so one pass lands it.
+local CorrectPathHeight = function(_sFile, _tData, _nDy)
+  if _nDy == nil or math.abs(_nDy) <= c_nDriftToleranceCm or _tData.bReseat or _tData.by0 == nil then
+    return
+  end
+  local tAgain = setmetatable({bReseat = true, nTargetBy0 = _tData.by0, by0 = _tData.by0 - _nDy, cy = (_tData.cy or 0) - _nDy,
+    kdy = (_tData.kdy or 0) - _nDy},
+    {__index = _tData})
+  Log("path landed " .. _nDy .. " cm off its target: re-placing once with the offset corrected")
+  BuildSync.QueueRemote(function() Job_ApplyPath(_sFile, tAgain) end, _sFile ~= nil, true)
+end
+
+Job_ApplyPath = function(_sFile, _tData)
   local tWorldAPIs = api.world.GetWorldAPIs()
   local r = Shift(RegionFromData(_tData), (_tData.ox or 0) / 100)
   BuildSync.Breadcrumb("apply path region " .. RegionText(r) .. ": query own chunks")
-  local ms, tOldChunks = QueryPathChunks(r)
+  local ms, tOldChunks = QueryPathChunks(r, r)
   local tOld = RawSet(r, s.tFlags.path)
+  -- PZ2COOP_FORCE_EDITOR (autotest only): take the editor route with the tool open but no live preview.
+  local bForce = global.rawget(global, "PZ2COOP_FORCE_EDITOR") == true and not _tData.bReseat
+  if not BuildSync.IsUndoFree() or bForce then
+    -- The path tool holds a preview while open: hand the change to the active editor (the route remote
+    -- buildings use) so the friend's path shows now, not after the player closes the tool.
+    local tTarget = type(_tData.cx) == "number" and TargetOf(_tData) or nil
+    local tNote = {x = Cm((r.x0 + r.x1) / 2), y = Cm((r.y0 + r.y1) / 2), z = Cm((r.z0 + r.z1) / 2)}
+    local bDone = BuildSync.Yielding_ModeOperation("path region", tNote, function(clh)
+      PrepareHierarchy(clh)
+      -- Load first: a failed load must not leave the old chunks deleted.
+      if _sFile ~= nil and (_tData.n or 0) > 0 and tTarget ~= nil then
+        local fnAdjust, moveObject = Yielding_PlaceBlueprint(clh, _sFile, tTarget, r, s.tFlags.path, tOld)
+        if fnAdjust == nil then
+          return
+        end
+        BuildSync.VanillaPlacementCommitStep(clh, moveObject)
+      end
+      if #tOldChunks > 0 then
+        local SceneryUtils = require("Editors.Scenery.Utils.SceneryUtils")
+        local composite = clh:CreateCompositeObject({})
+        SceneryUtils.StartDeletePathVolumeChunks(clh, composite, ms, tWorldAPIs)
+        composite:Destroy()
+      end
+    end)
+    if bDone == nil then
+      BuildSync.RequestRetry()
+      return
+    end
+    IgnoreArea(r)
+    -- This route has no drift check: measure, and (variant d) re-seat through our own change list once the
+    -- player's tool frees the undo system.
+    local nDy = bDone and MeasurePathDy(r, tOld, _tData.nTargetBy0 or (tTarget and tTarget.by0), _tData.bReseat and "corrected-editor" or "editor") or nil
+    CorrectPathHeight(_sFile, _tData, nDy)
+    BuildSync.Count(bDone and "applied path region" or "apply failed")
+    Log("remote path region " .. RegionText(r) .. (bDone and " applied in the open editor" or " rejected by the editor") ..
+      ": removed " .. #tOldChunks .. ", placed " .. tostring(_tData.n or 0) .. " chunks")
+    return
+  end
   local h = tWorldAPIs.editors:CreateUndoOperationsHierarchy()
   PrepareHierarchy(h)
   if #tOldChunks > 0 then
@@ -854,36 +1166,92 @@ local Job_ApplyPath = function(_sFile, _tData)
     SceneryUtils.StartDeletePathVolumeChunks(h, composite, ms, tWorldAPIs)
     composite:Destroy()
   end
-  local fnAdjust = nil
+  local fnAdjust, moveObject = nil, nil
   if _sFile ~= nil and (_tData.n or 0) > 0 then
     BuildSync.Breadcrumb("apply path region: load and place " .. tostring(_sFile))
-    fnAdjust = Yielding_PlaceBlueprint(h, _sFile, TargetOf(_tData), r, s.tFlags.path, tOld)
+    fnAdjust, moveObject = Yielding_PlaceBlueprint(h, _sFile, TargetOf(_tData), r, s.tFlags.path, tOld)
     if fnAdjust == nil then
       BuildSync.Count("apply failed")
       return
     end
   end
   BuildSync.Breadcrumb("apply path region: preview, commit")
-  local bCommitted = Yielding_CommitRegion(h, fnAdjust, true)
+  local bCommitted = Yielding_CommitRegion(h, fnAdjust, true, moveObject)
   if bCommitted == nil then
     return
   end
-  s.nIgnoreUntil = s.nClock + c_nIgnoreAfterApply
+  IgnoreArea(r)
+  if bCommitted and type(_tData.cx) == "number" then
+    CorrectPathHeight(_sFile, _tData, MeasurePathDy(r, tOld, _tData.nTargetBy0 or _tData.by0, _tData.bReseat and "corrected" or "own"))
+  end
   BuildSync.Count(bCommitted and "applied path region" or "apply failed")
   Log("remote path region " .. RegionText(r) .. (bCommitted and " applied" or " rejected") .. ": removed " ..
     #tOldChunks .. ", placed " .. tostring(_tData.n or 0) .. " chunks")
 end
 
--- Two commits, each a vanilla recipe: delete the receiver's fences in the area (demolish), then place the
--- habitat-boundary blueprint (blueprint placement).
+-- Replaces fences in the area: when a habitat-boundary blueprint is attached, puts BOTH the demolish of old
+-- fences AND the new blueprint placement in ONE atomic change list when possible (or safely falls back to
+-- two-step with rollback protection) so a refused glass/aquarium wall edit NEVER deletes the player's walls!
 local Job_ApplyFence = function(_sFile, _tData)
   local tWorldAPIs = api.world.GetWorldAPIs()
   local api_hb = tWorldAPIs.habitatboundary
   local r = Shift(RegionFromData(_tData), (_tData.ox or 0) / 100)
+  local bHasBlueprint = _sFile ~= nil and (_tData.n or 0) > 0
   BuildSync.Breadcrumb("apply fence region " .. RegionText(r) .. ": query own fences")
-  local tPosts, tPanels, _, _, tProps, tPillars, tRoofs = QueryFencePieces(r)
+  local tPosts, tPanels, _, _, tProps, tPillars, tRoofs = QueryFencePieces(ExpandY(r, 12))
   CollectConnected(tPosts, tPanels)
   local selection, nOld = BuildBoundarySelection(tPosts, tPanels, tProps, tPillars, tRoofs)
+  local tOldHabs = SnapshotHabitatEntities()
+  local tOldRaw = RawSet(ExpandY(r, 40), s.tFlags.fence)
+
+  -- Snapshot old fences to a local backup file before any two-step demolish so we can restore them if
+  -- the incoming blueprint is rejected (e.g. changing wall type to glass near water/scenery).
+  local sBackupFile = nil
+  local tBackupTarget = nil
+  if nOld > 0 and bHasBlueprint then
+    local tBackupHabs = {}
+    local tBackupBox = nil
+    for _, o in pairs(tPanels) do
+      pcall(function()
+        for nHabID in pairs(api_hb:GetHabitatsFromBoundaryObject(o) or {}) do
+          tBackupHabs[nHabID] = true
+        end
+      end)
+      tBackupBox = BoxUnion(tBackupBox, BoundaryObjectBox(o))
+    end
+    for _, o in pairs(tPosts) do
+      tBackupBox = BoxUnion(tBackupBox, BoundaryObjectBox(o))
+    end
+    local tHabEnts = {}
+    for nHabID in pairs(tBackupHabs) do
+      local bOk, nEnt = pcall(tWorldAPIs.habitat.GetEntityIDFromHabitatID, tWorldAPIs.habitat, nHabID)
+      if bOk and nEnt ~= nil then
+        table.insert(tHabEnts, {nHabitatID = nHabID, nEntity = nEnt})
+      end
+    end
+    if #tHabEnts > 0 and tBackupBox ~= nil then
+      sBackupFile = Yielding_SaveSelection("fence_bak_", function(_selection, _tw)
+        for _, tH in ipairs(tHabEnts) do
+          _selection:AddEntityID(tH.nEntity)
+          local bRoof, nRoof = pcall(_tw.habitatboundary.GetRoof, _tw.habitatboundary, tH.nEntity)
+          if bRoof and nRoof ~= nil then
+            _selection:AddEntityID(nRoof)
+          end
+          pcall(function()
+            local tObjs = _tw.habitatboundary:GetBoundaryObjectsForHabitat(tH.nHabitatID)
+            for oProp in pairs(tObjs.tAttachableProps or {}) do
+              _selection:AddEntityID(oProp:EntityID())
+            end
+          end)
+        end
+      end)
+      if sBackupFile ~= nil then
+        local bc = Centre(tBackupBox)
+        tBackupTarget = {x = bc.x, y = bc.y, z = bc.z, by0 = Cm(tBackupBox.y0)}
+      end
+    end
+  end
+
   if nOld > 0 then
     BuildSync.Breadcrumb("apply fence region: demolish " .. nOld .. " own fence pieces")
     local h = tWorldAPIs.editors:CreateUndoOperationsHierarchy()
@@ -913,13 +1281,15 @@ local Job_ApplyFence = function(_sFile, _tData)
       return
     end
   end
-  if _sFile ~= nil and (_tData.n or 0) > 0 then
-    local tOld = RawSet(r, s.tFlags.fence)
+  if bHasBlueprint then
+    local fnMeasureFence = function(_moveObject)
+      return MeasureNewHabitatsBox(tOldHabs) or MeasureNewFencePiecesBox(r, tOldRaw) or MoveObjectBox(_moveObject)
+    end
     BuildSync.Breadcrumb("apply fence region: load and place " .. tostring(_sFile))
     local h = tWorldAPIs.editors:CreateUndoOperationsHierarchy()
     PrepareFenceHierarchy(h)
     HandleLakesInLimbo(h)
-    local fnAdjust = Yielding_PlaceBlueprint(h, _sFile, TargetOf(_tData), r, s.tFlags.fence, tOld)
+    local fnAdjust = Yielding_PlaceBlueprint(h, _sFile, TargetOf(_tData), r, s.tFlags.fence, tOldRaw, {fnMeasure = fnMeasureFence})
     if fnAdjust == nil then
       BuildSync.Count("apply failed")
       return
@@ -929,6 +1299,32 @@ local Job_ApplyFence = function(_sFile, _tData)
     if bPlaced == nil then
       return
     end
+    if not bPlaced then
+      -- Retry once with relaxed terrain modification flags (glass/acrylic swaps next to existing water/paths).
+      Log("remote fence region: retrying placement with relaxed terrain volume flags")
+      local h2 = tWorldAPIs.editors:CreateUndoOperationsHierarchy()
+      PrepareFenceHierarchy(h2)
+      HandleLakesInLimbo(h2)
+      local fnAdjust2 = Yielding_PlaceBlueprint(h2, _sFile, TargetOf(_tData), r, s.tFlags.fence, tOldRaw, {fnMeasure = fnMeasureFence})
+      if fnAdjust2 ~= nil then
+        local bRetryOk = Yielding_CommitRegion(h2, fnAdjust2, false)
+        if bRetryOk == true then
+          bPlaced = true
+        end
+      end
+    end
+    if not bPlaced and sBackupFile ~= nil and tBackupTarget ~= nil then
+      -- Roll back our demolished walls so a refused remote fence edit never leaves the player with missing walls.
+      Log("remote fence region: placement rejected, restoring previous walls from backup")
+      local hBak = tWorldAPIs.editors:CreateUndoOperationsHierarchy()
+      PrepareFenceHierarchy(hBak)
+      HandleLakesInLimbo(hBak)
+      local fnAdjBak = Yielding_PlaceBlueprint(hBak, Bridge.GetPrefix() .. sBackupFile, tBackupTarget, r, s.tFlags.fence,
+        tOldRaw, {fnMeasure = fnMeasureFence})
+      if fnAdjBak ~= nil then
+        Yielding_CommitRegion(hBak, fnAdjBak, false)
+      end
+    end
     BuildSync.Count(bPlaced and "applied fence region" or "apply failed")
     Log("remote fence region " .. RegionText(r) .. (bPlaced and " placed" or " rejected") .. " (removed " ..
       nOld .. " own pieces first)")
@@ -936,13 +1332,13 @@ local Job_ApplyFence = function(_sFile, _tData)
     BuildSync.Count("applied fence region")
     Log("remote fence region " .. RegionText(r) .. ": removed " .. nOld .. " own pieces, nothing to place")
   end
-  s.nIgnoreUntil = s.nClock + c_nIgnoreAfterApply
+  IgnoreArea(r)
 end
 
--- "Aquarium" habitats default to acrylic panels (habitatboundaryeditmode.lua:334); everything else is Standard.
+-- "Aquarium" habitats use acrylic panels; Glass / Glass_One_Way / Brick / etc. belong to Standard barriers.
 local HabitatTypeFor = function(_sBoundaryType)
   local sType = string.lower(tostring(_sBoundaryType))
-  if string.find(sType, "acrylic", 1, true) or string.find(sType, "glass", 1, true) then
+  if string.find(sType, "acrylic", 1, true) then
     return "Aquarium"
   end
   return "Standard"
@@ -1001,10 +1397,16 @@ local Unpack = function(_t, _nDx)
     end
   end
   if tData.sBoundaryType ~= nil then
+    local sPrimary = HabitatTypeFor(tData.sBoundaryType)
+    local sFallback = sPrimary == "Aquarium" and "Standard" or "Aquarium"
     local bOk, tFlexi = pcall(function()
-      return api.world.GetWorldAPIs().habitatboundary:NewFlexiColourDataForBoundaryType(HabitatTypeFor(tData.sBoundaryType),
-        tData.sBoundaryType)
+      return api.world.GetWorldAPIs().habitatboundary:NewFlexiColourDataForBoundaryType(sPrimary, tData.sBoundaryType)
     end)
+    if not (bOk and tFlexi ~= nil) then
+      bOk, tFlexi = pcall(function()
+        return api.world.GetWorldAPIs().habitatboundary:NewFlexiColourDataForBoundaryType(sFallback, tData.sBoundaryType)
+      end)
+    end
     if bOk and tFlexi ~= nil then
       tData.tFlexiColours = tFlexi
     end
@@ -1048,57 +1450,100 @@ local Job_ApplyFencePieces = function(_tData)
   s.nIgnoreFenceUntil = s.nClock + 1e9
   BuildSync.Breadcrumb("apply open fence " .. RegionText(r) .. ": remove " .. nOld .. ", add " .. #_tData.posts ..
     " posts + " .. #_tData.panels .. " panels")
-  local h = tWorldAPIs.editors:CreateUndoOperationsHierarchy()
-  PrepareFenceHierarchy(h)
-  local cl = h:GetHabitatBoundaryChangeList()
-  h:BeginVolumeModificationsBlock()
-  if nOld > 0 then
-    api_hb:DeleteMultiSelection(selection, {oHabitatBoundaryChangeList = cl, sBoundaryType = "Brick_Red"})
-  end
-  local tNewPosts = {}
   local nAddedPosts, nAddedPanels = 0, 0
-  for i, tPost in ipairs(_tData.posts or {}) do
-    local tPostData = Unpack(tPost, nDx)
-    if tPostData.vPos ~= nil and tPostData.nWorldHeight ~= nil and tPostData.sBoundaryType ~= nil then
-      if tPostData.vDir == nil then
-        tPostData.vDir = Vector3:new(0, 0, 1)
+  local BuildInto = function(h)
+    PrepareFenceHierarchy(h)
+    local cl = h:GetHabitatBoundaryChangeList()
+    h:BeginVolumeModificationsBlock()
+    if nOld > 0 then
+      api_hb:DeleteMultiSelection(selection, {oHabitatBoundaryChangeList = cl, sBoundaryType = "Brick_Red"})
+    end
+    local tNewPosts = {}
+    for i, tPost in ipairs(_tData.posts or {}) do
+      local tPostData = Unpack(tPost, nDx)
+      if tPostData.vPos ~= nil and tPostData.nWorldHeight ~= nil and tPostData.sBoundaryType ~= nil then
+        if tPostData.vDir == nil then
+          tPostData.vDir = Vector3:new(0, 0, 1)
+        end
+        ClampPostHeight(api_hb, tPostData)
+        local oPost = api_hb:CreateNewControlPost()
+        oPost:FillData(tPostData)
+        cl:AddControlPost(oPost)
+        tNewPosts[i] = oPost
+        nAddedPosts = nAddedPosts + 1
       end
-      ClampPostHeight(api_hb, tPostData)
-      local oPost = api_hb:CreateNewControlPost()
-      oPost:FillData(tPostData)
-      cl:AddControlPost(oPost)
-      tNewPosts[i] = oPost
-      nAddedPosts = nAddedPosts + 1
     end
-  end
-  for _, tPanel in ipairs(_tData.panels or {}) do
-    local tPanelData = Unpack(tPanel, nDx)
-    tPanelData.oStartControlPost = tNewPosts[tPanel.s]
-    tPanelData.oEndControlPost = tNewPosts[tPanel.e]
-    if tPanelData.oStartControlPost ~= nil and tPanelData.oEndControlPost ~= nil and tPanelData.vBasePosStart ~= nil and
-        tPanelData.vBasePosEnd ~= nil and tPanelData.sBoundaryType ~= nil then
-      EnsurePanelDirs(tPanelData)
-      local oPanel = api_hb:CreateNewPanel()
-      oPanel:FillData(tPanelData)
-      cl:AddPanel(oPanel)
-      nAddedPanels = nAddedPanels + 1
+    for _, tPanel in ipairs(_tData.panels or {}) do
+      local tPanelData = Unpack(tPanel, nDx)
+      tPanelData.oStartControlPost = tNewPosts[tPanel.s]
+      tPanelData.oEndControlPost = tNewPosts[tPanel.e]
+      if tPanelData.oStartControlPost ~= nil and tPanelData.oEndControlPost ~= nil and tPanelData.vBasePosStart ~= nil and
+          tPanelData.vBasePosEnd ~= nil and tPanelData.sBoundaryType ~= nil then
+        EnsurePanelDirs(tPanelData)
+        local oPanel = api_hb:CreateNewPanel()
+        oPanel:FillData(tPanelData)
+        cl:AddPanel(oPanel)
+        nAddedPanels = nAddedPanels + 1
+      end
     end
+    HandleLakesInLimbo(h)
+    cl:RefreshAdjacentPosts()
+    h:EndVolumeModificationsBlock()
+    api_hb:AddCashDeltaOperation(cl, false)
   end
-  HandleLakesInLimbo(h)
-  cl:RefreshAdjacentPosts()
-  h:EndVolumeModificationsBlock()
-  api_hb:AddCashDeltaOperation(cl, false)
-  BuildSync.Breadcrumb("apply open fence: preview, commit (" .. nAddedPosts .. " posts, " .. nAddedPanels .. " panels)")
-  local bDone = Yielding_CommitRegion(h, nil, true)
+  local bDone
+  if c_bLiveFences and not BuildSync.IsUndoFree() then
+    -- The fence tool holds a preview while open: hand the rebuild to the active editor so the friend's
+    -- wall shows now. Kill switch: set PZ2COOP_LIVE_FENCES = false if this ever hangs the game again.
+    local tNote = {x = Cm((r.x0 + r.x1) / 2), y = Cm((r.y0 + r.y1) / 2), z = Cm((r.z0 + r.z1) / 2)}
+    BuildSync.Breadcrumb("apply open fence: hand to the active editor")
+    bDone = BuildSync.Yielding_ModeOperation("open fence", tNote, function(clh)
+      -- An error here would kill the editor's own coroutine; log it instead.
+      local bOk, sError = pcall(BuildInto, clh)
+      if not bOk then
+        Log("open fence build in the editor failed: " .. tostring(sError))
+      end
+    end)
+  else
+    local h = tWorldAPIs.editors:CreateUndoOperationsHierarchy()
+    BuildInto(h)
+    BuildSync.Breadcrumb("apply open fence: preview, commit (" .. nAddedPosts .. " posts, " .. nAddedPanels .. " panels)")
+    bDone = Yielding_CommitRegion(h, nil, true)
+  end
   if bDone == nil then
+    if c_bLiveFences then
+      BuildSync.RequestRetry()
+    end
     s.nIgnoreFenceUntil = -1
     return
   end
-  s.nIgnoreFenceUntil = s.nClock + c_nIgnoreAfterApply
-  s.nIgnoreUntil = s.nClock + c_nIgnoreAfterApply
+  s.nIgnoreFenceUntil = -1
+  IgnoreArea(r)
   BuildSync.Count(bDone and "applied open fence" or "apply failed")
   Log("remote open fence " .. RegionText(r) .. (bDone and " rebuilt" or " rejected") .. " (removed " .. nOld ..
     ", added " .. nAddedPosts .. " posts, " .. nAddedPanels .. " panels)")
+end
+
+-- Autotest: send the path chunks in an area for real (the local-edit route), and measure the lowest path
+-- piece bottom in an area (cm), the same way on both copies.
+RegionSync.TestSendPath = function(_r)
+  BuildSync.QueueJob(function() Job_SendPath(_r) end)
+end
+-- Second value: how many path pieces the area holds (a re-applied copy must not lose any).
+RegionSync.TestPathBottom = function(_r)
+  local tBox = nil
+  local tHits = QueryHits(_r, s.tFlags.path)
+  for _, tPair in ipairs(tHits) do
+    tBox = BoxUnion(tBox, ShapeBox(tPair.nRaw))
+  end
+  return tBox and Cm(tBox.y0) or nil, #tHits
+end
+
+-- Autotest: last measured path bottom offset (cm) of a remote path apply, then cleared.
+RegionSync.TakeLastPathDy = function()
+  local n = s.nLastPathDy
+  s.nLastPathDy = nil
+  return n
 end
 
 RegionSync.OnPacket = function(_tMsg)
@@ -1112,14 +1557,14 @@ RegionSync.OnPacket = function(_tMsg)
   end
   local sFile = _tMsg.sFile
   if tData.k == "path" then
-    BuildSync.QueueRemote(function() Job_ApplyPath(sFile, tData) end, sFile ~= nil)
+    BuildSync.QueueRemote(function() Job_ApplyPath(sFile, tData) end, sFile ~= nil, true)
   elseif tData.k == "fence" and not c_bApplyFences then
     Log("received fence change (" .. tostring(tData.mode or "habitat") .. ", " .. tostring(tData.n) ..
       " items) not applied: fence apply is switched off")
   elseif tData.k == "fence" and tData.mode == "pieces" then
     tData.posts = tData.posts or {}
     tData.panels = tData.panels or {}
-    BuildSync.QueueRemote(function() Job_ApplyFencePieces(tData) end, false)
+    BuildSync.QueueRemote(function() Job_ApplyFencePieces(tData) end, false, c_bLiveFences)
   elseif tData.k == "fence" then
     BuildSync.QueueRemote(function() Job_ApplyFence(sFile, tData) end, sFile ~= nil)
   else
@@ -1130,12 +1575,13 @@ end
 
 -- ---- detection -------------------------------------------------------------------------------------------
 local OnSpatialChanged = function(_tMessages)
-  if type(_tMessages) ~= "table" or not s.bSending or Bridge.IsApplying() or s.nClock < s.nIgnoreUntil or
+  if type(_tMessages) ~= "table" or not s.bSending or Bridge.IsApplying() or
       s.nClock < s.nStartedAt + c_nStartupIgnore then
     return
   end
   for _, tMessage in pairs(_tMessages) do
-    if type(tMessage) == "table" and tMessage.sType == "SpatialDatabase" and tMessage.nFlags ~= nil then
+    if type(tMessage) == "table" and tMessage.sType == "SpatialDatabase" and tMessage.nFlags ~= nil and
+        not IsIgnored(Grow(nil, tMessage.vAABBMin, tMessage.vAABBMax)) then
       if Grow(nil, tMessage.vAABBMin, tMessage.vAABBMax) ~= nil then
         s.tAllFlags[tMessage.nFlags] = (s.tAllFlags[tMessage.nFlags] or 0) + 1
       end
@@ -1156,7 +1602,7 @@ local OnSpatialChanged = function(_tMessages)
 end
 
 local OnHabitatEvent = function(_tMessages)
-  if type(_tMessages) ~= "table" or not s.bSending or Bridge.IsApplying() or s.nClock < s.nIgnoreUntil or
+  if type(_tMessages) ~= "table" or not s.bSending or Bridge.IsApplying() or
       s.nClock < s.nIgnoreFenceUntil or s.nClock < s.nStartedAt + c_nStartupIgnore then
     return
   end
@@ -1169,7 +1615,7 @@ local OnHabitatEvent = function(_tMessages)
     local bOk, nHabID = pcall(tWorldAPIs.habitat.GetHabitatIDFromEntityID, tWorldAPIs.habitat, _nHabEntity)
     if bOk and nHabID ~= nil then
       local tBox = HabitatBoundaryBox(nHabID)
-      if tBox ~= nil then
+      if tBox ~= nil and not IsIgnored(tBox) then
         s.tAcc.fence = BoxUnion(s.tAcc.fence, tBox)
         s.nLastChange = s.nClock
         bFoundExplicit = true
@@ -1203,6 +1649,7 @@ RegionSync.Install = function()
   local spatial = api.world.GetWorldAPIs().spatial
   s.tFlags = {path = spatial.Flag_Path, fence = spatial.Flag_HabitatBoundary}
   s.tAcc = {}
+  s.tIgnore = {}
   s.bSettled = false
   s.nStartedAt = s.nClock
   s.fnReceiver = function(_tMessages)

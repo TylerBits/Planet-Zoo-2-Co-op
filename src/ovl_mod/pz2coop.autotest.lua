@@ -9,6 +9,7 @@ local pairs = global.pairs
 local ipairs = global.ipairs
 local pcall = global.pcall
 local tostring = global.tostring
+local tonumber = global.tonumber
 local type = global.type
 local rawget = global.rawget
 local rawset = global.rawset
@@ -153,7 +154,14 @@ local StepMenu = function()
         if nextWorld.SetIsCareerExport ~= nil then
           nextWorld:SetIsCareerExport(false)
         end
-        return tEnv:RequireInterface("Interfaces.IParkLoadSaveManager"):RequestLoadParkFromFile(c_sTestZoo)
+        local pls = tEnv:RequireInterface("Interfaces.IParkLoadSaveManager")
+        local bOkLoad, sLoadErr = pls:RequestLoadParkFromFile(c_sTestZoo)
+        if not bOkLoad then
+          local sFlat = "/run/Zoos/Sandbox/Flat/Sandbox_Zoo_01_BL_Rural.bin"
+          Log("baseline missing, falling back to built-in flat Sandbox map: " .. sFlat)
+          return pls:RequestLoadParkFromFile(sFlat)
+        end
+        return bOkLoad, sLoadErr
       end)
       Log("requested baseline zoo load: ok=" .. tostring(bOk) .. " loaded=" .. tostring(bLoaded) .. " err=" .. tostring(sErr))
       if not bOk or bLoaded == false then
@@ -197,6 +205,14 @@ local StepParkHost = function()
     elseif s.sPlan == "showcase" then
       Bridge.SetLoopback(false)
       SetStage("sc_prepare")
+    elseif s.sPlan == "gate_probe" then
+      Bridge.SetLoopback(false)
+      SetStage("gp_setup")
+    elseif s.sPlan == "explore_preview" then
+      Bridge.SetLoopback(false)
+      SetStage("ep_enter")
+    elseif s.sPlan == "mirror_place" then
+      SetStage("mp_setup")
     else
       Bridge.SetLoopback(true)
       SetStage("test_notifications")
@@ -267,8 +283,9 @@ local StepPresence = function()
       local nOwn = tPres.tOwnBody.nAvatar
       local tWorld = api.world.GetWorldAPIs()
       local tParts = {}
+      local nHeadRig = tPres.tOwnBody.tAnim and tPres.tOwnBody.tAnim.nHeadRig
       for _, sP in ipairs({"Head", "Hair", "Torso", "Legs"}) do
-        local pId = api.entity.FindEntityByName(sP, nOwn)
+        local pId = api.entity.FindEntityByName(sP, nOwn) or (nHeadRig and api.entity.FindEntityByName(sP, nHeadRig))
         table.insert(tParts, sP .. "=" .. tostring(pId ~= nil))
       end
       Log("own avatar parts: " .. table.concat(tParts, " "))
@@ -410,6 +427,61 @@ local StepPresenceAnim = function()
       local bSwimMoved = p.tStats.swim ~= nil and p.tStats.swim.foot > 0.10
       local bNoErr = not tOwn.tAnim.bErrorLogged and (tFriend == nil or tFriend.tAnim == nil or not tFriend.tAnim.bErrorLogged)
       Record("avatar_animations", bNoErr and bWalkMoved and bRunMoved and bSwimMoved, table.concat(p.tStats, " | "))
+      -- Live-engine head-look verification: verify HeadRig RenderGroup transform, def_c_neck1_joint pivot, clamping, & 180-deg neutral.
+      local bHeadOk, bHeadPass, sHeadDetail = pcall(function()
+        local nHeadRig = tOwn.tAnim.nHeadRig
+        local tHeadParts = tOwn.tAnim.tHeadParts
+        local nNeck = tOwn.tAnim.nNeckAttach
+        if nHeadRig == nil or type(tHeadParts) ~= "table" or #tHeadParts < 1 then
+          return false, "no HeadRig or headParts recorded"
+        end
+        local bHasTr = tWorld.transform:HasTransform(nHeadRig) == true
+        local trAv = tWorld.transform:CalculateWorldTransform(tOwn.nAvatar)
+        local trNk = nNeck and tWorld.transform:CalculateWorldTransform(nNeck) or nil
+        local nNeckX, nNeckY, nNeckZ = nil, nil, nil
+        if trAv ~= nil and trNk ~= nil and trAv.ToLocalPos ~= nil then
+          local vPos = trNk.GetPos and trNk:GetPos() or (trNk.Pos and trNk:Pos())
+          local vLoc = vPos and trAv:ToLocalPos(vPos) or nil
+          if vLoc ~= nil then
+            nNeckX = vLoc.GetX and vLoc:GetX() or vLoc:X()
+            nNeckY = vLoc.GetY and vLoc:GetY() or vLoc:Y()
+            nNeckZ = vLoc.GetZ and vLoc:GetZ() or vLoc:Z()
+          end
+        end
+        -- Drive forward (+40/-20), verify engine actually applied local transform to HeadRig!
+        local yFwd, pFwd = 0, 0
+        for _ = 1, 25 do
+          yFwd, pFwd = Avatar.UpdateHeadLook(tOwn.tAnim, tOwn.nAvatar, math.rad(40), math.rad(-20), 0, 0, 0.05, false, false)
+        end
+        local trRigAfter = tWorld.transform:GetTransform(nHeadRig)
+        local nRigYawDeg = nil
+        if trRigAfter ~= nil and trRigAfter.GetOr ~= nil then
+          local vY = trRigAfter:GetOr():ToYawPitchRoll()
+          nRigYawDeg = vY and math.deg(vY.GetX and vY:GetX() or vY:X()) or nil
+        end
+        local yPeriph = 0
+        for _ = 1, 25 do
+          yPeriph = Avatar.UpdateHeadLook(tOwn.tAnim, tOwn.nAvatar, math.rad(90), 0, 0, 0, 0.05, false, false)
+        end
+        local ySelf, pSelf = 0, 0
+        for _ = 1, 35 do
+          ySelf, pSelf = Avatar.UpdateHeadLook(tOwn.tAnim, tOwn.nAvatar, math.rad(180), math.rad(-20), 0, 0, 0.05, false, false)
+        end
+        local bFriendHead = tFriend ~= nil and tFriend.tAnim ~= nil and tFriend.tAnim.nHeadRig ~= nil and
+          type(tFriend.tAnim.tHeadParts) == "table" and #tFriend.tAnim.tHeadParts >= 1
+        local bPass = bHasTr and (type(nNeckY) == "number" and nNeckY >= 0.9 and nNeckY <= 1.8) and
+          (type(nRigYawDeg) == "number" and nRigYawDeg > 25) and
+          yFwd > math.rad(25) and pFwd < math.rad(-10) and yPeriph <= math.rad(49) and
+          math.abs(ySelf) < 0.03 and math.abs(pSelf) < 0.03
+        return bPass, string.format("rig=%s parts=%d hasTr=%s rigYaw=%s neck=(%s,%s,%s) fwd=(%.1f,%.1f) periph=%.1f self=(%.1f,%.1f) friendHead=%s",
+          tostring(nHeadRig), #tHeadParts, tostring(bHasTr),
+          nRigYawDeg and string.format("%.1f", nRigYawDeg) or "nil",
+          nNeckX and string.format("%.3f", nNeckX) or "nil",
+          nNeckY and string.format("%.3f", nNeckY) or "nil",
+          nNeckZ and string.format("%.3f", nNeckZ) or "nil",
+          math.deg(yFwd), math.deg(pFwd), math.deg(yPeriph), math.deg(ySelf), math.deg(pSelf), tostring(bFriendHead))
+      end)
+      Record("head_look", bHeadOk and bHeadPass == true, tostring(bHeadOk and sHeadDetail or bHeadPass))
       s.tAnimProbe = nil
       SetStage("test_presence_done")
     end
@@ -1535,6 +1607,596 @@ local StepSCWalkEmotes = function()
   end
 end
 
+-- ---- gate_probe: inspect exact physics sweeps across a HabitatGate before & after opening ----
+local ProbeGateSweeps = function(_sTag, _vPos, _vF, _nGateID)
+  local Vector3 = require("Vector3")
+  local WalkingCamera = require("Components.Cameras.WalkingCamera")
+  local p = api.physics
+  local nPhys = api.entity.FindEntityByName("MainPhysicsWorld")
+  local tFlagNames = {
+    "Flag_Animal", "Flag_Building", "Flag_Scenery", "Flag_Tree_trunk",
+    "Flag_Tree_branch", "Flag_FirstPersonObstruction", "Flag_Prop",
+    "Flag_Car_OffTrack", "Flag_Landscape",
+  }
+  local gx, gy, gz = _vPos:GetX(), _vPos:GetY(), _vPos:GetZ()
+  local fx, fz = _vF:GetX(), _vF:GetZ()
+  local flen = math.sqrt(fx * fx + fz * fz)
+  if flen < 1e-4 then fx, fz = 0, 1 else fx, fz = fx / flen, fz / flen end
+  local vA = Vector3:new(gx - fx * 1.6, gy, gz - fz * 1.6)
+  local vB = Vector3:new(gx + fx * 1.6, gy, gz + fz * 1.6)
+  Log(string.format("GP[%s] gate=%s pos=(%.2f,%.2f,%.2f) fwd=(%.2f,%.2f)", _sTag, tostring(_nGateID), gx, gy, gz, fx, fz))
+  local nFullFlags = WalkingCamera.GetCollisionFlags(true)
+  for _, tBand in ipairs({{"eye1.55", 1.55, 0.15}, {"chest1.05", 1.05, 0.18}, {"waist0.65", 0.65, 0.16}}) do
+    local sName, h, r = tBand[1], tBand[2], tBand[3]
+    local vS = Vector3:new(vA:GetX(), gy + h, vA:GetZ())
+    local vE = Vector3:new(vB:GetX(), gy + h, vB:GetZ())
+    local tHitFlags = {}
+    for _, sF in ipairs(tFlagNames) do
+      local nF = p[sF]
+      if type(nF) == "number" and nF ~= 0 then
+        local tRes = p.SphereSweep(nPhys, vS, vE, r, nF, 4)
+        if type(tRes) == "table" and #tRes > 0 then
+          local t0 = tRes[1]
+          local sKeys = ""
+          if type(t0) == "table" then
+            local parts = {}
+            for k, v in pairs(t0) do
+              if k == "vNormal" and v ~= nil then
+                table.insert(parts, string.format("N=(%.2f,%.2f,%.2f)", v:GetX(), v:GetY(), v:GetZ()))
+              else
+                table.insert(parts, tostring(k) .. "=" .. tostring(v))
+              end
+            end
+            table.sort(parts)
+            sKeys = table.concat(parts, ",")
+          end
+          table.insert(tHitFlags, string.format("%s(#%d:%s)", sF, #tRes, sKeys))
+        end
+      end
+    end
+    Log(string.format("GP[%s] %s r=%.2f hits: %s", _sTag, sName, r, #tHitFlags > 0 and table.concat(tHitFlags, " ; ") or "NONE"))
+  end
+  -- Also test wrapped vs original SweepAndSlide from 1.6m in front to 1.6m behind at eye height
+  local vEyeA = Vector3:new(vA:GetX(), gy + 1.55, vA:GetZ())
+  local vEyeB = Vector3:new(vB:GetX(), gy + 1.55, vB:GetZ())
+  local fnOrig = rawget(WalkingCamera, "__PZ2CoopOriginalSweep") or WalkingCamera.SweepAndSlide
+  local vOrig = fnOrig(nPhys, vEyeA, vEyeB, nFullFlags, 0.15, 4)
+  local vWrap = WalkingCamera.SweepAndSlide(nPhys, vEyeA, vEyeB, nFullFlags, 0.15, 4)
+  local function prog(v)
+    return (v:GetX() - vEyeA:GetX()) * fx + (v:GetZ() - vEyeA:GetZ()) * fz
+  end
+  Log(string.format("GP[%s] Sweep orig=%.2f/3.20 (y=%.2f) wrap=%.2f/3.20 (y=%.2f)",
+    _sTag, prog(vOrig), vOrig:GetY(), prog(vWrap), vWrap:GetY()))
+end
+
+local StepGPSetup = function()
+  local tWorld = api.world.GetWorldAPIs()
+  local Vector3 = require("Vector3")
+  local fpi = tWorld.FirstPersonInteraction
+  local tGates = {}
+  if fpi ~= nil and type(fpi.tEntities) == "table" then
+    for nEnt, tInfo in pairs(fpi.tEntities) do
+      if type(tInfo) == "table" and tInfo.sType == "HabitatGate" then
+        table.insert(tGates, tInfo.nParentEntityID or nEnt)
+      end
+    end
+  end
+  if #tGates == 0 and tWorld.facilities ~= nil then
+    local bOkF, tHabs = pcall(function() return tWorld.facilities:GetAllHabitatsEntityIDs() end)
+    if bOkF and type(tHabs) == "table" then
+      for k, v in pairs(tHabs) do
+        table.insert(tGates, type(v) == "number" and v or k)
+      end
+    end
+  end
+  if #tGates == 0 then
+    if not s.gpBuilt then
+      if s.nStageTime < 2.0 then
+        return
+      end
+      s.gpBuilt = true
+      -- Place a real 8x8 Brick_Red habitat loop + HabitatGate on flat ground so the test is 100% deterministic.
+      local BuildSync = require("PZ2Coop.BuildSync")
+      local RegionSync = require("PZ2Coop.RegionSync")
+      local vCam = tWorld.CameraModeManager:GetPosYPRZoom()
+      local tx, tz = vCam:GetX(), vCam:GetZ()
+      local ty = RaycastGroundY(tx, tz, 0)
+      for _, tOff in ipairs({{0, 0}, {30, 0}, {-30, 0}, {0, 30}, {0, -30}, {40, 40}, {-40, 40}}) do
+        local cx, cz = vCam:GetX() + tOff[1], vCam:GetZ() + tOff[2]
+        local cy = RaycastGroundY(cx, cz, nil)
+        if cy ~= nil then
+          local np, nl = CountFenceInBox(cx + 4, cy, cz + 4, 14)
+          if np == 0 and nl == 0 then
+            tx, ty, tz = cx, cy, cz
+            break
+          end
+        end
+      end
+      s.gpBuildPos = {x = tx, y = ty, z = tz}
+      local y1 = RaycastGroundY(tx, tz, ty)
+      local y2 = RaycastGroundY(tx + 8, tz, ty)
+      local y3 = RaycastGroundY(tx + 8, tz + 8, ty)
+      local y4 = RaycastGroundY(tx, tz + 8, ty)
+      local p1 = MakePost(tx - 50, y1, tz, 1, 0, "Brick_Red", 2.5)
+      local p2 = MakePost(tx - 42, y2, tz, 0, 1, "Brick_Red", 2.5)
+      local p3 = MakePost(tx - 42, y3, tz + 8, -1, 0, "Brick_Red", 2.5)
+      local p4 = MakePost(tx - 50, y4, tz + 8, 0, -1, "Brick_Red", 2.5)
+      RegionSync.OnPacket({
+        nType = 0x22,
+        tData = {
+          k = "fence", mode = "pieces", n = 8, ox = 5000,
+          x0 = math.floor((tx - 53) * 100), y0 = math.floor((y1 - 5) * 100), z0 = math.floor((tz - 3) * 100),
+          x1 = math.floor((tx - 39) * 100), y1 = math.floor((y1 + 8) * 100), z1 = math.floor((tz + 11) * 100),
+          posts = Arr(p1, p2, p3, p4),
+          panels = Arr(MakePanel(1, 2, p1, p2, "Brick_Red"), MakePanel(2, 3, p2, p3, "Brick_Red"),
+            MakePanel(3, 4, p3, p4, "Brick_Red"), MakePanel(4, 1, p4, p1, "Brick_Red")),
+        },
+      })
+      Log(string.format("GP: building test habitat loop at (%.1f, %.1f, %.1f)", tx, y1, tz))
+      return
+    end
+    if not s.gpGatePlaced and s.nStageTime >= 5.0 then
+      s.gpGatePlaced = true
+      local BuildSync = require("PZ2Coop.BuildSync")
+      local tx, ty, tz = s.gpBuildPos.x, s.gpBuildPos.y, s.gpBuildPos.z
+      local y1 = RaycastGroundY(tx + 4, tz, ty)
+      BuildSync.QueueJob(function()
+        local w = api.world.GetWorldAPIs()
+        local api_hb = w.habitatboundary
+        local h = w.editors:CreateUndoOperationsHierarchy()
+        pcall(function() h:SetBoundaryEditPreviewModeModifyVolumes(true) end)
+        h:SetPerformTerrainModificationsModifyVolumes(false)
+        local op = h:GetTerrainEditOperation()
+        w.gameterrain:SetTerrainEditOpCollisionFlags(op, true, false, false, true, true,
+          w.gameterrain.CheckLakesMode_WhenTerrainCollisionEnabled, false)
+        w.gameterrain:SetTerrainEditOpGridRenderingEnabled(op, false)
+        local cl = h:GetHabitatBoundaryChangeList()
+        h:BeginVolumeModificationsBlock()
+        local vGate = Vector3:new(tx + 4, y1, tz)
+        local bOk, sRes = pcall(function()
+          return api_hb:PlaceAttachableProp("habitatgate", {
+            oHabitatBoundaryChangeList = cl,
+            vPlacePoint = vGate,
+            vFacingDirection = Vector3:new(0, 0, -1),
+            vRayStart = Vector3:new(tx + 4, y1 + 20, tz),
+            vRayDir = Vector3:new(0, -1, 0),
+            nSmoothness = 0, nPanelMode = 0,
+            nHeightAngleStart = 0, nHeightAngleEnd = 0,
+            nWindowCutDistFromBase = 0, nWindowCutDistFromTop = 0,
+            nBoundaryExtraFlags = 0,
+            nTopRelativeHeight = 2.5, nTopWorldHeight = y1 + 2.5,
+            bTopHeightWorldRelative = false, bBottomHeightWorldRelative = false,
+            bUseHeightDeadZones = false, nDeadZoneRange = 0.25,
+            bAlignMultiSelectHeights = false,
+            sBoundaryType = "Brick_Red", sHabitatType = "Standard",
+          })
+        end)
+        cl:RefreshAdjacentPosts()
+        h:EndVolumeModificationsBlock()
+        h:Commit()
+        Log("GP: PlaceAttachableProp(habitatgate) ok=" .. tostring(bOk) .. " res=" .. tostring(sRes))
+      end, "gp place gate")
+      return
+    end
+    if s.nStageTime < 14.0 then
+      return
+    end
+    Record("gate_probe", false, "no habitat gate appeared after building test habitat")
+    SetStage("cleanup")
+    return
+  end
+  Log("GP: found " .. tostring(#tGates) .. " habitat gate(s), using id=" .. tostring(tGates[1]))
+  local nGateID = tGates[1]
+  local tr = tWorld.transform:CalculateWorldTransform(nGateID)
+  local vPos = tr:GetPos()
+  local vF = tr:GetF()
+  s.gp = {nGateID = nGateID, vPos = vPos, vF = vF, bOpened = false}
+  local vStart = Vector3:new(vPos:GetX() - vF:GetX() * 2.0, vPos:GetY() + 1.55, vPos:GetZ() - vF:GetZ() * 2.0)
+  pcall(function()
+    require("Editors.Shared.BaseUIMode").SetNewMode("WalkingCamera", {vStartingPos = vStart})
+  end)
+  ProbeGateSweeps("CLOSED", vPos, vF, nGateID)
+  SetStage("gp_open")
+end
+
+local StepGPOpen = function()
+  local gp = s.gp
+  local tWorld = api.world.GetWorldAPIs()
+  local Presence = require("PZ2Coop.Presence")
+  local WalkingCamera = require("Components.Cameras.WalkingCamera")
+  local Vector3 = require("Vector3")
+  if not gp.bOpened then
+    if s.nStageTime < 1.0 then return end
+    gp.bOpened = true
+    Log("GP: opening gate " .. tostring(gp.nGateID) .. " (RequestHabitatGateOpen + SetLocalOpenGate)")
+    tWorld.attractions:RequestHabitatGateOpen(gp.nGateID)
+    Presence.SetLocalOpenGate(gp.nGateID)
+    Presence.SetOpenGatePos("local", {x = gp.vPos:GetX(), y = gp.vPos:GetY(), z = gp.vPos:GetZ()})
+    return
+  end
+  if s.nStageTime >= 3.0 then
+    ProbeGateSweeps("OPENED", gp.vPos, gp.vF, gp.nGateID)
+    local p = api.physics
+    local nPhys = api.entity.FindEntityByName("MainPhysicsWorld")
+    local nFlags = WalkingCamera.GetCollisionFlags(true)
+    local gx, gy, gz = gp.vPos:GetX(), gp.vPos:GetY(), gp.vPos:GetZ()
+    local fx, fz = gp.vF:GetX(), gp.vF:GetZ()
+    local flen = math.sqrt(fx * fx + fz * fz)
+    if flen < 1e-4 then fx, fz = 0, 1 else fx, fz = fx / flen, fz / flen end
+    local rx, rz = fz, -fx
+    local vFront = Vector3:new(gx - fx * 1.6, gy + 1.55, gz - fz * 1.6)
+    local vBack = Vector3:new(gx + fx * 1.6, gy + 1.55, gz + fz * 1.6)
+    -- 1) Opened gate: walk front -> back and back -> front
+    local vFwd = WalkingCamera.SweepAndSlide(nPhys, vFront, vBack, nFlags, 0.15, 4)
+    local nFwdProg = (vFwd:GetX() - vFront:GetX()) * fx + (vFwd:GetZ() - vFront:GetZ()) * fz
+    local vRev = WalkingCamera.SweepAndSlide(nPhys, vBack, vFront, nFlags, 0.15, 4)
+    local nRevProg = (vBack:GetX() - vRev:GetX()) * fx + (vBack:GetZ() - vRev:GetZ()) * fz
+    -- 2) Side wall 1.6 m off-center MUST still block while gate is open
+    local vSideA = Vector3:new(gx + rx * 1.6 - fx * 1.6, gy + 1.55, gz + rz * 1.6 - fz * 1.6)
+    local vSideB = Vector3:new(gx + rx * 1.6 + fx * 1.6, gy + 1.55, gz + rz * 1.6 + fz * 1.6)
+    local vSide = WalkingCamera.SweepAndSlide(nPhys, vSideA, vSideB, nFlags, 0.15, 4)
+    local nSideProg = (vSide:GetX() - vSideA:GetX()) * fx + (vSide:GetZ() - vSideA:GetZ()) * fz
+    -- 3) Close gate again -> MUST block again
+    Presence.SetLocalOpenGate(nil)
+    Presence.SetOpenGatePos("local", nil)
+    tWorld.attractions:ReleaseHabitatGateOpenRequest(gp.nGateID)
+    local vClosed = WalkingCamera.SweepAndSlide(nPhys, vFront, vBack, nFlags, 0.15, 4)
+    local nClosedProg = (vClosed:GetX() - vFront:GetX()) * fx + (vClosed:GetZ() - vFront:GetZ()) * fz
+    pcall(function() require("Editors.Shared.BaseUIMode").SetNewMode("Select") end)
+    local sDetail = string.format("openFwd=%.2f/3.20 openRev=%.2f/3.20 sideWall=%.2f/3.20 reclosed=%.2f/3.20",
+      nFwdProg, nRevProg, nSideProg, nClosedProg)
+    local bPass = nFwdProg >= 3.10 and nRevProg >= 3.10 and nSideProg < 2.0 and nClosedProg < 2.0
+    Record("gate_walkthrough", bPass, sDetail)
+    SetStage("cleanup")
+  end
+end
+
+local StepEPEnter = function()
+  local BaseUIMode = require("Editors.Shared.BaseUIMode")
+  local Vector3 = require("Vector3")
+  local Presence = require("PZ2Coop.Presence")
+  local tWorld = api.world.GetWorldAPIs()
+  if not s.epStarted then
+    s.epStarted = true
+    local worldScript = api.world.GetScript(api.world.GetActive())
+    local hud = worldScript and worldScript:GetHUD()
+    if hud and hud.FullScreenUIPause then
+      pcall(hud.FullScreenUIPause, hud, false)
+    end
+    if hud and hud.ChangeSimulationSpeedSettings then
+      pcall(hud.ChangeSimulationSpeedSettings, hud, false, 1)
+    end
+    if api.time and api.time.Unpause then
+      for _ = 1, 3 do
+        if (api.time.GetDeltaTime and api.time.GetDeltaTime() or 0) <= 0 then
+          pcall(api.time.Unpause, "World")
+        end
+      end
+    end
+    local vCam = tWorld.CameraModeManager:GetPosYPRZoom()
+    local tFinal = tWorld.CameraModeManager:GetCameraDataFinal()
+    local vCentre = (tFinal and tFinal.vCentrePos) or vCam or Vector3:new(0, 10, 0)
+    local gx, gy, gz = vCentre:GetX(), vCentre:GetY(), vCentre:GetZ()
+    if vCam ~= nil then
+      local dx, dz = gx - vCam:GetX(), gz - vCam:GetZ()
+      local d = math.sqrt(dx * dx + dz * dz)
+      if d > 8.0 then
+        gx = vCam:GetX() + (dx / d) * 6.0
+        gz = vCam:GetZ() + (dz / d) * 6.0
+      end
+    end
+    s.epStartPos = Vector3:new(gx, gy + 1.55, gz)
+    s.epOrigStartPos = tWorld.CameraModeManager.GetWalkingStartPos
+    tWorld.CameraModeManager.GetWalkingStartPos = function() return s.epStartPos end
+    BaseUIMode.SetNewMode("WalkingCameraInit")
+    Log(string.format("EP: entered WalkingCameraInit pos=(%.1f,%.1f,%.1f)", gx, gy, gz))
+    return
+  end
+  local tPrev = Presence.GetExplorePreview()
+  if tPrev ~= nil and tPrev.nAvatar ~= nil and tPrev.tAnim ~= nil then
+    local tok = api.entity.CreateRequestCompletionToken()
+    local nFoot = api.entity.InstantiatePrefab("AttachPoint", "PZ2CoopEPFoot", tok, nil, tPrev.nAvatar, true,
+      {AttachBone = "def_l_foot_joint"})
+    local nHead = api.entity.InstantiatePrefab("AttachPoint", "PZ2CoopEPHead", tok, nil, tPrev.nAvatar, true,
+      {AttachBone = "def_c_head_joint"})
+    s.ep = {tok = tok, nFoot = nFoot, nHead = nHead,
+      minFootY = 1e9, maxFootY = -1e9, minHeadY = 1e9, maxHeadY = -1e9, nSamples = 0,
+      footSpan = {n = 0}, bSawLoop = false, nLoopStartClock = nil}
+    Record("explore_preview_spawn", true, "entity=" .. tostring(tPrev.nAvatar) .. " initClip=" .. tostring(tPrev.tAnim.sClip))
+    SetStage("ep_measure")
+    return
+  end
+  if s.nStageTime >= 15.0 then
+    if s.epOrigStartPos then tWorld.CameraModeManager.GetWalkingStartPos = s.epOrigStartPos s.epOrigStartPos = nil end
+    Record("explore_preview_spawn", false, "timed out waiting for explore preview avatar")
+    BaseUIMode.SetNewMode("Select")
+    SetStage("cleanup")
+  end
+end
+
+local StepEPMeasure = function()
+  local BaseUIMode = require("Editors.Shared.BaseUIMode")
+  local Presence = require("PZ2Coop.Presence")
+  local tWorld = api.world.GetWorldAPIs()
+  local tPrev = Presence.GetExplorePreview()
+  local ep = s.ep
+  if tPrev == nil or tPrev.nAvatar == nil or ep == nil then
+    if s.epOrigStartPos then tWorld.CameraModeManager.GetWalkingStartPos = s.epOrigStartPos s.epOrigStartPos = nil end
+    Record("explore_preview_loop", false, "preview vanished during measurement")
+    BaseUIMode.SetNewMode("Select")
+    SetStage("cleanup")
+    return
+  end
+  if tWorld.bakedanimation and tWorld.bakedanimation.RequestAllBonesForCalculate then
+    pcall(tWorld.bakedanimation.RequestAllBonesForCalculate, tWorld.bakedanimation, tPrev.nAvatar)
+  end
+  if tPrev.sPhase == "loop" then
+    if not ep.bSawLoop then
+      ep.bSawLoop = true
+      ep.nLoopStartClock = s.nStageTime
+    end
+    local nElapsed = s.nStageTime - ep.nLoopStartClock
+    if api.entity.HaveRequestsCompleted(ep.tok) then
+      local bOkA, trAv = pcall(tWorld.transform.CalculateWorldTransform, tWorld.transform, tPrev.nAvatar)
+      local bOkF, trF = pcall(tWorld.transform.CalculateWorldTransform, tWorld.transform, ep.nFoot)
+      local bOkH, trH = pcall(tWorld.transform.CalculateWorldTransform, tWorld.transform, ep.nHead)
+      if bOkA and trAv ~= nil and bOkF and trF ~= nil and bOkH and trH ~= nil then
+        local ay = trAv:GetPos():GetY()
+        local fy = trF:GetPos():GetY() - ay
+        local hy = trH:GetPos():GetY() - ay
+        if fy < ep.minFootY then ep.minFootY = fy end
+        if fy > ep.maxFootY then ep.maxFootY = fy end
+        if hy < ep.minHeadY then ep.minHeadY = hy end
+        if hy > ep.maxHeadY then ep.maxHeadY = hy end
+        ep.nSamples = ep.nSamples + 1
+        SampleBoneRange(ep.footSpan, ep.nFoot)
+      end
+    end
+    if nElapsed >= 1.8 or s.nStageTime >= 6.0 then
+      if ep.nFoot then pcall(api.entity.DestroyEntity, ep.nFoot) end
+      if ep.nHead then pcall(api.entity.DestroyEntity, ep.nHead) end
+      if s.epOrigStartPos then tWorld.CameraModeManager.GetWalkingStartPos = s.epOrigStartPos s.epOrigStartPos = nil end
+      local nSpan = RangeSpan(ep.footSpan)
+      local sDetail = string.format("loop(n=%d) footY=[%.3f,%.3f] headY=[%.3f,%.3f] span=%.3fm",
+        ep.nSamples, ep.minFootY, ep.maxFootY, ep.minHeadY, ep.maxHeadY, nSpan)
+      local bPass = ep.bSawLoop and ep.nSamples >= 5 and ep.minFootY > 2.0 and nSpan > 0.15
+      Record("explore_preview_loop", bPass, sDetail)
+      BaseUIMode.SetNewMode("Select")
+      SetStage("ep_exit")
+    end
+  elseif s.nStageTime >= 6.0 then
+    if s.epOrigStartPos then tWorld.CameraModeManager.GetWalkingStartPos = s.epOrigStartPos s.epOrigStartPos = nil end
+    Record("explore_preview_loop", false, "never reached loop phase")
+    BaseUIMode.SetNewMode("Select")
+    SetStage("ep_exit")
+  end
+end
+
+local StepEPExit = function()
+  local Presence = require("PZ2Coop.Presence")
+  if s.nStageTime < 0.5 then
+    return
+  end
+  local bClean = Presence.GetExplorePreview() == nil
+  Record("explore_preview_cleanup", bClean, bClean and "preview destroyed cleanly on Select" or "preview still alive")
+  SetStage("cleanup")
+end
+
+-- ---- plan "mirror_place": remote path/floor + aquarium applies, own route vs open-editor route ----------
+-- Fixtures (the player's own blueprints, copied by tools/test_live_game.py, never in git):
+-- <game>\PZ2Coop\test_path.bin (path/floor chunks) and test_aquarium.bin (a prefab aquarium group).
+-- Each case prints one MEASURE line. Path PASS: new pieces' bottom within 2 cm of the sent bottom (by0).
+-- Aquarium PASS: applied and the apply produced terrain edits (flatten/paint), as the sender's commit does.
+local c_nPathTolCm = 2
+local c_tMPCases = {
+  {sName = "mp_path_own", sKind = "path"},
+  {sName = "mp_path_editor", sKind = "path", bEditor = true},
+  {sName = "mp_aquarium_probe", sKind = "aq", bProbe = true}, -- learns the group's real half height
+  {sName = "mp_aquarium_own", sKind = "aq"},
+  {sName = "mp_aquarium_editor", sKind = "aq", bEditor = true},
+}
+
+local GroundGrid = function(_x, _z)
+  local t = {}
+  for i = -2, 2 do
+    for j = -2, 2 do
+      table.insert(t, RaycastGroundY(_x + i * 3, _z + j * 3, 0) or 0)
+    end
+  end
+  return t
+end
+
+local GridMaxDelta = function(_a, _b)
+  local n = 0
+  for i = 1, #_a do
+    n = math.max(n, math.abs((_b[i] or 0) - _a[i]))
+  end
+  return math.floor(n * 100 + 0.5)
+end
+
+local AppliedGroups = function()
+  local BuildSync = require("PZ2Coop.BuildSync")
+  return tonumber(string.match(BuildSync.Summary(), "applied group=(%d+)") or "0") or 0
+end
+
+local OpenPathTool = function()
+  local ModeChangeRequestPathEditUI = require("Editors.Path.ModeChangeRequestPathEditUI")
+  local req = ModeChangeRequestPathEditUI:new()
+  req:StartPathTool()
+  req:PerformModeChange()
+end
+
+local CloseTool = function()
+  pcall(function() require("Editors.Shared.BaseUIMode").SetNewMode("Select") end)
+end
+
+local StepMPSetup = function()
+  local tWorld = api.world.GetWorldAPIs()
+  local vCam = tWorld.CameraModeManager:GetPosYPRZoom()
+  -- 60 m inside the camera spot: the +50 m mirror must stay inside the playable area (round 2: bOutsidePlayableArea).
+  s.mp = {cx = vCam:GetX() - 60, cz = vCam:GetZ(), i = 0, nTerrainEdits = 0, nVoxelChanges = 0}
+  s.mp.fnTerrain = function() s.mp.nTerrainEdits = s.mp.nTerrainEdits + 1 end
+  s.mp.fnVolume = function(_tMessages)
+    for _, t in pairs(type(_tMessages) == "table" and _tMessages or {}) do
+      if type(t) == "table" and t.sType == "VoxelTerrain" then
+        s.mp.nVoxelChanges = s.mp.nVoxelChanges + 1
+      end
+    end
+  end
+  pcall(function() api.messaging.RegisterReceiver(api.messaging.MsgType_TerrainEditStatsMessage, s.mp.fnTerrain) end)
+  pcall(function() api.messaging.RegisterReceiver(api.messaging.MsgType_SpatialVolumeChangedMessage, s.mp.fnVolume) end)
+  Bridge.SetLoopback(false)
+  Log(string.format("mirror_place: base (%.1f,%.1f)", s.mp.cx, s.mp.cz))
+  SetStage("mp_case")
+end
+
+local FinishMPCase = function(_bPass, _sDetail)
+  local mp = s.mp
+  rawset(global, "PZ2COOP_FORCE_EDITOR", nil)
+  Bridge.SetLoopback(false)
+  CloseTool()
+  Bridge.Log("MEASURE " .. mp.case.sName .. " " .. _sDetail)
+  Record(mp.case.sName, _bPass, _sDetail)
+  mp.case = nil
+end
+
+local StepMPCase = function()
+  local mp = s.mp
+  local RegionSync = require("PZ2Coop.RegionSync")
+  local BuildSync = require("PZ2Coop.BuildSync")
+  if mp.case == nil then
+    mp.i = mp.i + 1
+    local tCase = c_tMPCases[mp.i]
+    if tCase == nil then
+      pcall(function() api.messaging.UnregisterReceiver(api.messaging.MsgType_TerrainEditStatsMessage, mp.fnTerrain) end)
+      pcall(function() api.messaging.UnregisterReceiver(api.messaging.MsgType_SpatialVolumeChangedMessage, mp.fnVolume) end)
+      SetStage("cleanup")
+      return
+    end
+    -- One clean spot per case, 40 m apart along z, so cases never touch each other.
+    local x, z = mp.cx, mp.cz + 40 * mp.i
+    mp.case = {sName = tCase.sName, tCase = tCase, x = x, z = z, y = RaycastGroundY(x, z, 0), sPhase = "open", nT = 0, nT0 = s.nStageTime}
+    if tCase.bEditor then
+      OpenPathTool()
+    end
+    return
+  end
+  local c = mp.case
+  c.nT = s.nStageTime - c.nT0
+  if c.sPhase == "open" then
+    if c.nT < 1.5 then
+      return -- let the tool finish opening
+    end
+    local tCase = c.tCase
+    local SetRouteFlags = function()
+      if tCase.bEditor then
+        rawset(global, "PZ2COOP_FORCE_EDITOR", true)
+      end
+    end
+    c.tGrid = GroundGrid(c.x, c.z)
+    c.nEdits0, c.nVox0 = mp.nTerrainEdits, mp.nVoxelChanges
+    RegionSync.TakeLastPathDy()
+    local nX, nY, nZ = math.floor(c.x * 100 + 0.5), math.floor(c.y * 100 + 0.5), math.floor(c.z * 100 + 0.5)
+    if tCase.sKind == "path" then
+      -- Reference copy at P (stands in for the player's own path); sent for real once it settled.
+      c.rRef = {x0 = c.x - 15, y0 = c.y - 3, z0 = c.z - 15, x1 = c.x + 15, y1 = c.y + 6, z1 = c.z + 15}
+      c.fnSetRouteFlags = SetRouteFlags
+      RegionSync.OnPacket({nType = 0x22, sFile = Bridge.GetPrefix() .. "test_path.bin", tData = {
+        k = "path", n = 1, cx = nX, cy = nY + 50, cz = nZ, by0 = nY,
+        x0 = nX - 1500, y0 = nY - 300, z0 = nZ - 1500, x1 = nX + 1500, y1 = nY + 600, z1 = nZ + 1500}})
+      c.sPhase = "ref"
+      c.nT, c.nT0 = 0, s.nStageTime
+      return
+    else
+      SetRouteFlags()
+      c.nGroups0 = AppliedGroups()
+      -- The fixture's group centre sat 6.9 m above its ground on the sender.
+      BuildSync.OnPacket({nType = 0x20, sFile = Bridge.GetPrefix() .. "test_aquarium.bin",
+        tData = {x = nX, y = nY + (mp.nAqHalfCm or 690), z = nZ}})
+      BuildSync.TakeLastGroupBox()
+    end
+    c.sPhase = "wait"
+    c.nT, c.nT0 = 0, s.nStageTime
+    return
+  end
+  local tCase = c.tCase
+  if c.sPhase == "ref" then
+    if RegionSync.TakeLastPathDy() ~= nil then
+      c.bRefDone = true
+      c.nRefAt = c.nT
+    end
+    if c.bRefDone and c.nT - c.nRefAt >= 1.0 then
+      -- Real send: the local-edit route saves the area, loopback mirrors it 50 m east through the route under test.
+      c.nRefBottom = RegionSync.TestPathBottom(c.rRef)
+      c.nEdits0, c.nVox0 = mp.nTerrainEdits, mp.nVoxelChanges
+      Bridge.SetLoopback(true)
+      c.fnSetRouteFlags()
+      RegionSync.TestSendPath(c.rRef)
+      c.sPhase = "wait"
+      c.nT, c.nT0 = 0, s.nStageTime
+    elseif c.nT >= 15.0 then
+      FinishMPCase(false, "reference path never applied")
+    end
+    return
+  end
+  -- wait phase
+  if tCase.sKind == "path" then
+    local nDyNow = RegionSync.TakeLastPathDy()
+    if nDyNow ~= nil then
+      c.nLastDyAt = c.nT
+      c.nFirstDy = c.nFirstDy or nDyNow
+    end
+    local nSettle = 3.0 -- room for the one height-correcting re-place
+    if (c.nLastDyAt ~= nil and c.nT - c.nLastDyAt >= nSettle) or c.nT >= 20.0 then
+      local rMirror = {x0 = c.rRef.x0 + 50, y0 = c.rRef.y0, z0 = c.rRef.z0, x1 = c.rRef.x1 + 50, y1 = c.rRef.y1, z1 = c.rRef.z1}
+      local nMirBottom, nMirHits = RegionSync.TestPathBottom(rMirror)
+      if c.nHits1 == nil then
+        -- Send the same path again: the mirror now replaces its own copy (removes, then places). Gaps in the
+        -- 2026-11-27 play test sat exactly where a mirror replaced its own chunks.
+        c.nHits1 = nMirHits
+        c.nLastDyAt = nil
+        c.nT, c.nT0 = 0, s.nStageTime
+        c.fnSetRouteFlags()
+        RegionSync.TestSendPath(c.rRef)
+        return
+      end
+      local nDy = (nMirBottom ~= nil and c.nRefBottom ~= nil) and (nMirBottom - c.nRefBottom) or nil
+      Bridge.SetLoopback(false)
+      -- First placement must land: a corrective re-place leaves the first copy's terrain flatten behind.
+      local bPass = nDy ~= nil and math.abs(nDy) <= c_nPathTolCm and c.nFirstDy ~= nil and math.abs(c.nFirstDy) <= c_nPathTolCm and
+        nMirHits == c.nHits1
+      FinishMPCase(bPass, string.format("hits=%d->%d ref=%s mirror=%s dy=%s firstDy=%s terrainEdits=%d voxel=%d t=%.1fs",
+        c.nHits1, nMirHits, tostring(c.nRefBottom), tostring(nMirBottom), tostring(nDy), tostring(c.nFirstDy), mp.nTerrainEdits - c.nEdits0, mp.nVoxelChanges - c.nVox0, c.nT))
+    end
+  else
+    local bApplied = AppliedGroups() > c.nGroups0
+    c.tBox = BuildSync.TakeLastGroupBox() or c.tBox
+    local nLanded = BuildSync.TakeLastLandedCm()
+    if nLanded ~= nil then
+      c.nLanded, c.nLandedAt = nLanded, c.nT
+    end
+    -- Wait for the landing report and room for one correcting re-place after it.
+    if (c.nLandedAt ~= nil and c.nT - c.nLandedAt >= 8.0) or c.nT >= 30.0 then
+      local nEdits, nVox = mp.nTerrainEdits - c.nEdits0, mp.nVoxelChanges - c.nVox0
+      local nGround = GridMaxDelta(c.tGrid, GroundGrid(c.x, c.z))
+      local nGroundCm = math.floor(c.y * 100 + 0.5)
+      local sBottom = c.tBox and tostring(math.floor(c.tBox.y0 - nGroundCm + 0.5)) or "nil"
+      if tCase.bProbe then
+        if c.tBox ~= nil then
+          mp.nAqHalfCm = math.floor((c.tBox.y1 - c.tBox.y0) / 2 + 0.5)
+        end
+        FinishMPCase(c.tBox ~= nil, string.format("halfHeight=%s bottomAboveGround=%s terrainEdits=%d voxel=%d",
+          tostring(mp.nAqHalfCm), sBottom, nEdits, nVox))
+        return
+      end
+      -- PASS: the final copy sits on its target. Terrain edits are reported as a measurement.
+      local bPass = c.nLanded ~= nil and c.nLanded <= c_nPathTolCm
+      FinishMPCase(bPass, string.format("landed=%s applied=%s bottomAboveGround=%s terrainEdits=%d voxel=%d groundDelta=%dcm t=%.1fs",
+        tostring(c.nLanded), tostring(bApplied), sBottom, nEdits, nVox, nGround, c.nT))
+    end
+  end
+end
+
 local c_tStages = {
   wait_menu = StepMenu,
   wait_park = StepWaitPark,
@@ -1560,6 +2222,13 @@ local c_tStages = {
   sc_habitat_walls = StepSCHabitatWalls,
   sc_water_sync = StepSCWaterSync,
   sc_walk_emotes = StepSCWalkEmotes,
+  gp_setup = StepGPSetup,
+  gp_open = StepGPOpen,
+  ep_enter = StepEPEnter,
+  ep_measure = StepEPMeasure,
+  ep_exit = StepEPExit,
+  mp_setup = StepMPSetup,
+  mp_case = StepMPCase,
   cleanup = StepCleanup,
 }
 

@@ -116,6 +116,12 @@ int main(int argc, char** argv) {
         check(line && line->type == 32 && line->file == "clip_1.bin" && line->json == R"({"k":1})", "lua line parse");
         check(!pz2::parseLuaLine(R"(32 ..\evil {"k":1})"), "lua line rejects path");
         check(!pz2::parseLuaLine(R"(99 - {})"), "lua line rejects unknown type");
+        const auto vpose = pz2::parseLuaLine(R"(19 - {"k":"vpose","x":1,"y":2,"z":3,"yaw":0.5,"pitch":0,"roll":0,"spd":4,"steer":0})");
+        check(vpose && vpose->type == 0x13 && vpose->file.empty(), "lua line parses 0x13 vehicle pose");
+        check(pz2::isKnownPacketType(0x13) && pz2::isUnreliable(pz2::PacketType::VEHICLE_POSE_20HZ) &&
+                  pz2::fixedPayloadSize(pz2::PacketType::VEHICLE_POSE_20HZ) == 0 &&
+                  !pz2::isEchoGuarded(pz2::PacketType::VEHICLE_POSE_20HZ),
+              "0x13 VEHICLE_POSE_20HZ is known, unreliable, variable-size JSON, and not echo-guarded");
     }
     {
         const auto ledger = pz2::packFixed(pz2::PacketType::LEDGER_SYNC_1HZ, R"({"cash":123456,"cc":42,"speed":1,"tod":12.5})");
@@ -130,17 +136,28 @@ int main(int argc, char** argv) {
         check(pz2::fixedPayloadSize(pz2::PacketType::ACTION_DELETE_SPATIAL) == 0,
               "delete is a JSON packet (part name and peer flag survive the wire)");
         check(!pz2::packFixed(pz2::PacketType::CURSOR_TRANSFORM_20HZ, R"({"cx":1})"), "cursor needs all fields");
-        const char* presence = R"({"cx":1.5,"cy":2,"cz":-3,"px":4,"py":5,"pz":6,"yaw":0.25,"m":2})";
+        const char* presence = R"({"cx":1.5,"cy":2,"cz":-3,"px":4,"py":5,"pz":6,"yaw":0.25,"m":2,"pitch":-0.375})";
         const auto cursor = pz2::packFixed(pz2::PacketType::CURSOR_TRANSFORM_20HZ, presence);
         check(cursor && cursor->size() == 1 + sizeof(pz2::CursorTransformPayload), "presence packs");
         if (cursor) {
             check(pz2::unpackFixed(pz2::PacketType::CURSOR_TRANSFORM_20HZ, cursor->data() + 1, cursor->size() - 1) ==
                       presence,
-                  "presence round-trips with mode");
+                  "presence round-trips with mode and pitch");
         }
+        const auto cursorNoPitch = pz2::packFixed(
+            pz2::PacketType::CURSOR_TRANSFORM_20HZ,
+            R"({"cx":1.5,"cy":2,"cz":-3,"px":4,"py":5,"pz":6,"yaw":0.25,"m":2})");
+        check(cursorNoPitch &&
+                  pz2::unpackFixed(pz2::PacketType::CURSOR_TRANSFORM_20HZ, cursorNoPitch->data() + 1,
+                                   cursorNoPitch->size() - 1) ==
+                      R"({"cx":1.5,"cy":2,"cz":-3,"px":4,"py":5,"pz":6,"yaw":0.25,"m":2,"pitch":0})",
+              "presence without pitch defaults to 0");
         check(!pz2::packFixed(pz2::PacketType::CURSOR_TRANSFORM_20HZ,
                               R"({"cx":1,"cy":2,"cz":3,"px":4,"py":5,"pz":6,"yaw":0,"m":7})"),
               "presence rejects bad mode");
+        check(!pz2::packFixed(pz2::PacketType::CURSOR_TRANSFORM_20HZ,
+                              R"({"cx":1,"cy":2,"cz":3,"px":4,"py":5,"pz":6,"yaw":0,"m":2,"pitch":9})"),
+              "presence rejects out-of-range pitch");
     }
 
     // File bridge end to end in a temp folder: Lua hello + packet out, peer packet + save back in.

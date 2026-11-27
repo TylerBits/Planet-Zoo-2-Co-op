@@ -84,17 +84,30 @@ local Bridge = {
   GetPrefix = function() return "/run/PZ2Coop/" end,
   SendPacket = function(n, f, d) table.insert(packets, {n = n, f = f, d = d}) end,
 }
+local function vec2(x, y)
+  return {GetX = function() return x end, GetY = function() return y end}
+end
 local TerrainEditMode = {
   TransitionIn = function(self) self.GameTerrainAPI = rawGameTerrain end,
   TransitionOut = function(self) end,
+  Advance = function(self, dt) call("VanillaTerrainAdvance", dt) end,
+}
+local TerrainShapeStampMode = {
+  TransitionIn = function(self) end,
+  TransitionOut = function(self) end,
+  FeaturePlaced = function(self, ...) call("VanillaShapePlaced", ...) end,
 }
 local stubs = {
+  Vector2 = {new = function(_, x, y) return vec2(x, y) end},
   Vector3 = {new = function(_, x, y, z) return vec(x, y, z) end},
-  TransformQ = {},
-  Quaternion = {},
+  TransformQ = {FromOrPos = function(q, v) return {q = q, pos = v, GetPos = function() return v end, GetOrientation = function() return q end} end},
+  Quaternion = {new = function(_, x, y, z, w) return {GetX = function() return x end, GetY = function() return y end, GetZ = function() return z end, GetW = function() return w end} end,
+    FromYawPitchRoll = function(v) return {ypr = v} end,
+    Identity = {GetX = function() return 0 end, GetY = function() return 0 end, GetZ = function() return 0 end, GetW = function() return 1 end}},
   ["PZ2Coop.Bridge"] = Bridge,
   ["Editors.Scenery.SceneryEditHelper"] = {},
   ["Editors.Terrain.TerrainEditMode"] = TerrainEditMode,
+  ["Editors.Terrain.TerrainShapeStampMode"] = TerrainShapeStampMode,
 }
 local loaded = {}
 require = function(name)
@@ -162,6 +175,57 @@ calls = {}
 TerrainSync.OnPacket({nType = 0x23, tData = {k = "terrain", dabs = {{op = "evil_op", x = 0, y = 0, z = 0, sz = 100, int = 100}}}})
 tick(6)
 assert(count("CommitPreview") == 0, "invalid terrain op should not commit")
+
+-- 5) Concurrent terrain safety: while local player holds terrain brush (bMouseHeld == true),
+--    remote strokes MUST wait in queue (zero concurrent PreviewChangeList) and drain once released
+calls = {}
+mode.bMouseHeld = true
+assert(TerrainSync.OnPacket({nType = 0x23, tData = {k = "terrain", dabs = {{op = "pushpull", x = 1000, y = 200, z = 2000, sz = 12000, int = 100}}}}) == true)
+tick(10)
+assert(count("PreviewChangeList") == 0 and count("CommitPreview") == 0,
+  "regression: remote terrain preview ran while local player was sculpting! previews=" .. count("PreviewChangeList"))
+mode.bMouseHeld = false
+tick(10)
+assert(count("CommitPreview") == 1 and count("AddPushPull") == 1,
+  "deferred terrain stroke failed to drain after local brush release:\n" .. dump())
+assert(math.abs(lastCall("AddPushPull").args[4] - 120.0) < 0.01,
+  "large brush size (120 m) was clamped! got " .. tostring(lastCall("AddPushPull").args[4]))
+
+-- 6) Shape stamp send & replay
+packets, calls = {}, {}
+tWorldAPIs.editors.CreateUndoOperationsHierarchy = function()
+  call("CreateShapeHierarchy")
+  return {
+    GetFullUndoChangeList = function() return {kind = "shape_cl"} end,
+    GetTerrainEditOperation = function() return {kind = "shape_op"} end,
+    CreateTerrainShapeStamp = function(_, shape, vSize, bFill, nAng)
+      call("CreateTerrainShapeStamp", shape, vSize:GetX(), vSize:GetY(), vSize:GetZ(), bFill, nAng)
+      return {SetTransform = function(_, tr) call("StampSetTransform", tr.pos:GetX(), tr.pos:GetZ()) end}
+    end,
+  }
+end
+local stampMode = {
+  sShapeType = "cube",
+  bFill = true,
+  vSize = vec(30, 15, 30),
+  nWedgeAngle = 0,
+  lastCommittedTransform = {
+    GetPos = function() return vec(40, 2, 50) end,
+    GetOr = function() return {ToYawPitchRoll = function() return vec(0, 0, 0) end} end,
+  },
+}
+TerrainShapeStampMode.TransitionIn(stampMode)
+TerrainShapeStampMode.FeaturePlaced(stampMode)
+assert(#packets == 1 and packets[1].d.k == "terrain" and packets[1].d.op == "shapestamp" and packets[1].d.shape == "cube",
+  "shape stamp packet missing:\n" .. dump())
+TerrainShapeStampMode.TransitionOut(stampMode)
+local sp = packets[1]
+sp.d.ox = 5000
+assert(TerrainSync.OnPacket({nType = 0x23, tData = sp.d}) == true)
+tick(10)
+assert(count("CreateTerrainShapeStamp") == 1 and count("CommitPreview") == 1,
+  "remote shape stamp did not apply:\n" .. dump())
+assert(math.abs(lastCall("StampSetTransform").args[1] - 90.0) < 0.01, "shape stamp ox shift wrong")
 return "ok: terrain sync"
 """
 

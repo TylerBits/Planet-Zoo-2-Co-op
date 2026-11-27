@@ -23,6 +23,8 @@ local type = global.type
 local setmetatable = global.setmetatable
 local require = global.require
 local Vector3 = require("Vector3")
+local Quaternion = require("Quaternion")
+local TransformQ = require("TransformQ")
 local Bridge = require("PZ2Coop.Bridge")
 local BuildSync = require("PZ2Coop.BuildSync")
 
@@ -55,6 +57,7 @@ local s = {
   tExhibitAnimals = {}, -- nAnimalID -> {nExhibitID, sSpecies, x, y, z (cm)}
   tHabitatKnown = {}, -- nEntityID -> {sSyncId, sSpecies, bContra, x, y, z (cm)}
   tBySyncId = {}, -- sSyncId -> nEntityID
+  tRequestedReconcile = {}, -- sSyncId -> true (avoid duplicate catch-up spawns from 0x31)
 }
 
 local Log = function(_s)
@@ -356,6 +359,63 @@ local FindHabitatAnimal = function(_sSyncId, _sSpecies, _xCm, _yCm, _zCm)
   return nBest
 end
 
+local ReadAnimalGenderAge = function(_animals, _nEntityID)
+  local nGender, nAge = 0, 1
+  pcall(function()
+    if _animals.GetGender ~= nil then
+      local g = _animals:GetGender(_nEntityID)
+      if type(g) == "number" then
+        nGender = g == 1 and 1 or 0
+      elseif type(g) == "boolean" then
+        nGender = g and 1 or 0
+      end
+    elseif _animals.IsFemale ~= nil then
+      nGender = _animals:IsFemale(_nEntityID) == true and 1 or 0
+    end
+  end)
+  pcall(function()
+    if _animals.IsJuvenile ~= nil then
+      nAge = _animals:IsJuvenile(_nEntityID) == true and 0 or 1
+    end
+  end)
+  return nGender, nAge
+end
+
+local FindHabitatAt = function(_xCm, _yCm, _zCm)
+  local tWorld = api.world.GetWorldAPIs()
+  local vPos = Vector3:new(_xCm / 100, _yCm / 100, _zCm / 100)
+  local bCont, nHabEnt = pcall(function()
+    if tWorld.habitat ~= nil and tWorld.habitat.GetHabitatContainingPoint ~= nil then
+      return tWorld.habitat:GetHabitatContainingPoint(vPos, true, 3.0)
+    end
+    return nil
+  end)
+  if bCont and nHabEnt ~= nil then
+    return nHabEnt
+  end
+  local bAll, tHabs = pcall(function()
+    return tWorld.facilities and tWorld.facilities:GetAllHabitatsEntityIDs() or nil
+  end)
+  if not bAll or type(tHabs) ~= "table" then
+    return nil
+  end
+  local nBest, nBestD2 = nil, math.huge
+  for _, nEnt in pairs(tHabs) do
+    local hx, hy, hz = EntityPosCm(nEnt)
+    if hx ~= nil then
+      local dx, dz = hx - _xCm, hz - _zCm
+      local d2 = dx * dx + dz * dz
+      if d2 < nBestD2 then
+        nBestD2 = d2
+        nBest = nEnt
+      end
+    elseif nBest == nil then
+      nBest = nEnt
+    end
+  end
+  return nBest
+end
+
 local PollHabitatAnimals = function()
   local tAll, tWorld = ListHabitatAnimals()
   local animals = tWorld and tWorld.animals
@@ -423,6 +483,23 @@ local PollHabitatAnimals = function()
         s.tHabitatKnown[nEntityID] = {sSyncId = sSyncId, sSpecies = sSp, bContra = bCOk and bContra == true,
           x = ax, y = ay, z = az}
         s.tBySyncId[sSyncId] = nEntityID
+        if s.bSending and not Bridge.IsApplying() and not IsRemoteEcho("hab_add:" .. sSp, ax, ay, az) then
+          local nGender, nAge = ReadAnimalGenderAge(animals, nEntityID)
+          BuildSync.Count("sent animal add")
+          Log(string.format("local habitat animal add %s (id %s) at (%.1f,%.1f,%.1f)",
+            sSp, sSyncId, ax / 100, ay / 100, az / 100))
+          Bridge.SendPacket(c_nAnimalEventPacket, nil, {
+            k = "animal",
+            op = "add",
+            id = sSyncId,
+            s = sSp,
+            g = nGender,
+            age = nAge,
+            x = ax,
+            y = ay,
+            z = az,
+          })
+        end
       end
     else
       if ax ~= nil then
@@ -471,10 +548,14 @@ local SendWaypointsIfHost = function()
   end
 end
 
+local Job_ApplyHabitatAnimal -- forward declaration for waypoint catch-up
+
 local ApplyWaypoints = function(_tData)
   if type(_tData.a) ~= "table" then
     return
   end
+  local tWorld = api.world.GetWorldAPIs()
+  local animals = tWorld and tWorld.animals
   for i = 1, math.min(#_tData.a, c_nMaxWaypointsPerPacket) do
     local tEntry = _tData.a[i]
     if type(tEntry) == "table" and IsSafeSyncId(tEntry.id) and IsSafeSpecies(tEntry.s) and
@@ -489,13 +570,75 @@ local ApplyWaypoints = function(_tData)
           tKnown.sSyncId = tEntry.id
           s.tBySyncId[tEntry.id] = nTarget
         end
+        -- Reconcile large animal position drift (> 12 m) gently via vanilla transport API when safe.
+        if Bridge.GetRole() == "client" and animals ~= nil and animals.AttemptRequestToTransportAnimalToPosition ~= nil then
+          local ax, ay, az = EntityPosCm(nTarget)
+          if ax ~= nil then
+            local dx, dz = (ax - tEntry.x) / 100, (az - tEntry.z) / 100
+            if dx * dx + dz * dz > 12.0 * 12.0 then
+              pcall(function()
+                local bBoxed = animals.IsBoxed and animals:IsBoxed(nTarget) == true
+                if not bBoxed then
+                  animals:AttemptRequestToTransportAnimalToPosition(nTarget,
+                    Vector3:new(tEntry.x / 100, tEntry.y / 100, tEntry.z / 100))
+                end
+              end)
+            end
+          end
+        end
+      elseif Bridge.GetRole() == "client" and not s.tRequestedReconcile[tEntry.id] then
+        -- Client is missing a habitat animal that exists on the host: catch-up spawn it once.
+        s.tRequestedReconcile[tEntry.id] = true
+        local tAdd = {k = "animal", op = "add", id = tEntry.id, s = tEntry.s, g = tEntry.g or 0, age = tEntry.age or 1,
+          x = tEntry.x, y = tEntry.y, z = tEntry.z}
+        BuildSync.QueueJob(function() Job_ApplyHabitatAnimal(tAdd) end)
       end
     end
   end
 end
 
-local Job_ApplyHabitatAnimal = function(_tData)
+Job_ApplyHabitatAnimal = function(_tData)
   if not IsSafeSpecies(_tData.s) then
+    return
+  end
+  if _tData.op == "add" then
+    local tWorld = api.world.GetWorldAPIs()
+    local facilities = tWorld and tWorld.facilities
+    if facilities == nil or facilities.CreateAnimalInHabitatAtTransform == nil then
+      Log("remote animal add: facilities:CreateAnimalInHabitatAtTransform unavailable")
+      return
+    end
+    local nHabEntityID = FindHabitatAt(_tData.x, _tData.y, _tData.z)
+    if nHabEntityID == nil then
+      Log(string.format("remote animal add %s: no habitat found near (%.1f,%.1f,%.1f)",
+        _tData.s, _tData.x / 100, _tData.y / 100, _tData.z / 100))
+      return
+    end
+    local nGender = _tData.g == 1 and 1 or 0
+    local nAge = _tData.age == 0 and 0 or 1
+    local vPos = Vector3:new(_tData.x / 100, _tData.y / 100, _tData.z / 100)
+    NoteRemote("hab_add:" .. _tData.s, _tData.x, _tData.y, _tData.z)
+    BuildSync.Breadcrumb("apply habitat animal add " .. _tData.s)
+    Bridge.BeginApply()
+    local bOk, tRes = pcall(function()
+      return facilities:CreateAnimalInHabitatAtTransform(nHabEntityID, nGender, nAge, _tData.s,
+        TransformQ.FromOrPos(Quaternion.Identity, vPos))
+    end)
+    Bridge.EndApply()
+    if bOk then
+      local nEnt = type(tRes) == "table" and (tRes.animalEntityID or tRes.nEntityID or tRes.entityID) or nil
+      local sSyncId = IsSafeSyncId(_tData.id) and _tData.id or nil
+      if nEnt ~= nil and sSyncId ~= nil then
+        s.tHabitatKnown[nEnt] = {sSyncId = sSyncId, sSpecies = _tData.s, bContra = false,
+          x = _tData.x, y = _tData.y, z = _tData.z}
+        s.tBySyncId[sSyncId] = nEnt
+      end
+      BuildSync.Count("applied animal add")
+      Log(string.format("remote habitat animal add %s into habitat %s", _tData.s, tostring(nHabEntityID)))
+    else
+      BuildSync.Count("animal add failed")
+      Log("remote habitat animal add failed: " .. tostring(tRes))
+    end
     return
   end
   local nTarget = FindHabitatAnimal(_tData.id, _tData.s, _tData.x, _tData.y, _tData.z)
@@ -588,6 +731,7 @@ AnimalSync.ResetSnapshot = function()
   s.tExhibitAnimals = {}
   s.tHabitatKnown = {}
   s.tBySyncId = {}
+  s.tRequestedReconcile = {}
   s.bHabitatSeeded = false
   s.nStartedAt = s.nClock
 end
@@ -648,7 +792,7 @@ AnimalSync.OnPacket = function(_tMsg)
     if not (IsFinite(d.x) and IsFinite(d.y) and IsFinite(d.z)) then
       return true
     end
-    if d.op == "contraceptive" or d.op == "remove" then
+    if d.op == "add" or d.op == "contraceptive" or d.op == "remove" then
       BuildSync.QueueJob(function() Job_ApplyHabitatAnimal(d) end)
     end
     return true

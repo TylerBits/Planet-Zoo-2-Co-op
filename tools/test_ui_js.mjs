@@ -19,10 +19,12 @@ for (const name of ['CoopMenu.js', 'JoinFriends.js', 'EmoteWheel.js']) {
     });
 }
 
-// 2. Verify CoopMenu, JoinFriends & EmoteWheel source invariants
+// 2. Verify CoopMenu, JoinFriends, EmoteWheel & Browser patch source invariants
 const coopSrc = fs.readFileSync(path.join(UI_DIR, 'CoopMenu.js'), 'utf8');
 const joinSrc = fs.readFileSync(path.join(UI_DIR, 'JoinFriends.js'), 'utf8');
 const wheelSrc = fs.readFileSync(path.join(UI_DIR, 'EmoteWheel.js'), 'utf8');
+const browserItemsPatch = fs.readFileSync(path.join(UI_DIR, 'browseritemsdatabase_patch.js'), 'utf8');
+const browserUtilsPatch = fs.readFileSync(path.join(UI_DIR, 'browserutils_patch.js'), 'utf8');
 const pauseMenuPatch = fs.readFileSync(path.join(UI_DIR, 'pausemenu_patch.js'), 'utf8');
 const pausePatch = fs.readFileSync(path.join(UI_DIR, 'pausemenumodule_patch.js'), 'utf8');
 
@@ -57,6 +59,19 @@ assert.match(wheelSrc, /RadialItem/, 'EmoteWheel must reuse vanilla RadialItem')
 assert.match(wheelSrc, /PaperPanelBackground/, 'EmoteWheel must reuse vanilla PaperPanelBackground');
 assert.match(wheelSrc, /Paginator/, 'EmoteWheel must reuse vanilla Paginator');
 assert.match(wheelSrc, /enableHitBoxes:\s*true/, 'EmoteWheel must enable mouse hitboxes on RadialItem');
+assert.doesNotMatch(pausePatch, /VehicleHUD/, 'Custom VehicleHUD must be removed from PauseMenuModule patch');
+assert.doesNotMatch(pausePatch, /pz2coopVehicleHUD/, 'pz2coopVehicleHUD binding must be removed from PauseMenuModule patch');
+assert.ok(!fs.existsSync(path.join(UI_DIR, 'VehicleHUD.js')), 'VehicleHUD.js must be deleted');
+assert.ok(!fs.existsSync(path.join(UI_DIR, 'VehicleHUD.css')), 'VehicleHUD.css must be deleted');
+assert.match(coopSrc, /vrecall/, 'CoopMenu must expose vehicle recall controls');
+assert.match(browserItemsPatch, /isPz2CoopResearchVehicleItem/, 'BrowserItemsDatabase patch must export isPz2CoopResearchVehicleItem');
+assert.match(browserItemsPatch, /MenuCategory_Facilities_Transport/, 'BrowserItemsDatabase patch must add leaf Facilities Transport tag');
+assert.match(browserItemsPatch, /tags\.slice\(\)/, 'BrowserItemsDatabase patch must copy tags defensively before pushing');
+assert.match(browserItemsPatch, /isCoreItem = true/, 'BrowserItemsDatabase patch must mark vehicle items as core/essential');
+assert.doesNotMatch(browserItemsPatch, /currentGamemodeIs/, 'BrowserItemsDatabase patch must NOT call currentGamemodeIs during startup before gameModeHelper is ready');
+assert.doesNotMatch(browserItemsPatch, /'MenuCategory_Facilities'/, 'BrowserItemsDatabase patch must never add root category tag MenuCategory_Facilities');
+assert.match(browserUtilsPatch, /gameModeHelper && currentGamemodeIs\(GameMode\.Franchise\)/, 'BrowserUtils patch must gate out Franchise mode dynamically with null-safe gameModeHelper');
+assert.match(browserUtilsPatch, /showEssentials == true && !item\.isCoreItem && !pz2CoopUnlockVehicle/, 'BrowserUtils patch must bypass Essentials filter for unlocked Research Vehicles');
 
 // 2b. Verify every custom PZ2Coop_*.svg icon referenced in EmoteWheel.js exists and is a valid 40x40 white SVG
 const iconMatches = [...wheelSrc.matchAll(/icon:\s*'(PZ2Coop_[A-Za-z0-9_]+)'/g)].map((m) => m[1]);
@@ -100,6 +115,28 @@ const helpersCode = [
 ].join('\n');
 
 const { literal, parseCoopState, isGuestWorld, coopMenuValue, statusOf, joinPill, parseEmoteState, polarSegmentIndex } = new Function(helpersCode)();
+
+// 4. Test browseritemsdatabase_patch.js + browserutils_patch.js unlock logic (Sandbox vs Franchise, Outpost vs AcousticMonitor)
+const isVehFnSrc = extractFn(browserItemsPatch, 'isPz2CoopResearchVehicleItem');
+const isPz2CoopResearchVehicleItem = new Function(`${isVehFnSrc}\nreturn isPz2CoopResearchVehicleItem;`)();
+assert.equal(isPz2CoopResearchVehicleItem('FAC_Wild_ResearchOutpost', 'img/Scenery/Textures/FAC_Wild_ResearchOutpost.png', 'Research Outpost'), true);
+assert.equal(isPz2CoopResearchVehicleItem('921', 'img/Blueprints/Textures/RTW_GRASS_VehicleStation.png', 'Grassland Vehicle Station'), true, 'Blueprint numeric UID with VehicleStation icon must match');
+assert.equal(isPz2CoopResearchVehicleItem('1234', 'img/Scenery/Textures/UndefinedImage.png', 'Research Outpost'), true, 'Label fallback must match Research Outpost');
+assert.equal(isPz2CoopResearchVehicleItem('FAC_Wild_AcousticMonitor', 'img/Scenery/Textures/FAC_Wild_AcousticMonitor.png', 'Acoustic Monitor'), false, 'Acoustic Monitor must NOT match');
+assert.equal(isPz2CoopResearchVehicleItem('FAC_Wild_CameraTrap', 'img/Scenery/Textures/FAC_Wild_CameraTrap.png', 'Camera Trap'), false, 'Camera Trap must NOT match');
+
+const GM = { Franchise: 'Franchise', Sandbox: 'Sandbox' };
+const Area = { Any: 0, ZooOnly: 1, WildAreaOnly: 2 };
+function shouldRejectArea(item, isWildArea, modeHelper) {
+    const currentGamemodeIs = (m) => modeHelper.value === m;
+    const pz2CoopUnlockVehicle = isPz2CoopResearchVehicleItem(item.uid, item.icon) && !(modeHelper && currentGamemodeIs(GM.Franchise));
+    return isWildArea && item.areaType == Area.ZooOnly || (!isWildArea && item.areaType == Area.WildAreaOnly && !pz2CoopUnlockVehicle);
+}
+assert.equal(shouldRejectArea({ uid: 'FAC_Wild_ResearchOutpost', icon: '', areaType: Area.WildAreaOnly }, false, { value: GM.Sandbox }), false, 'Sandbox must show Research Outpost in normal zoos');
+assert.equal(shouldRejectArea({ uid: '921', icon: 'img/Blueprints/Textures/RTW_GRASS_VehicleStation.png', areaType: Area.WildAreaOnly }, false, { value: GM.Sandbox }), false, 'Sandbox must show Vehicle Station blueprint');
+assert.equal(shouldRejectArea({ uid: 'FAC_Wild_AcousticMonitor', icon: '', areaType: Area.WildAreaOnly }, false, { value: GM.Sandbox }), true, 'Acoustic Monitor must stay Reserve-only');
+assert.equal(shouldRejectArea({ uid: 'FAC_Wild_ResearchOutpost', icon: '', areaType: Area.WildAreaOnly }, false, { value: GM.Franchise }), true, 'Franchise must hide Research Outpost in normal zoos');
+assert.equal(shouldRejectArea({ uid: 'FAC_Wild_ResearchOutpost', icon: '', areaType: Area.WildAreaOnly }, true, { value: GM.Franchise }), false, 'Franchise Reserve keeps vanilla Research Outpost');
 
 assert.deepEqual(parseEmoteState(''), { open: false, page: 1 });
 assert.equal(polarSegmentIndex(0, -100, 8).index, 0, '12 o-clock must map to segment 0');

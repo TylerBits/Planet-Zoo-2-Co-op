@@ -74,8 +74,7 @@ python tools/build_ovl_mod.py --uninstall
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — System architecture, shared-memory bridge, echo suppression, and invariants
 - [`docs/NETWORK_PROTOCOL.md`](docs/NETWORK_PROTOCOL.md) — Binary packet headers, Steam P2P channels, and payload schemas
-- [`docs/LUA_API_MAP.md`](docs/LUA_API_MAP.md) — Engine Lua & UI API reference
-- [`docs/LUA_EXTRACTION_GUIDE.md`](docs/LUA_EXTRACTION_GUIDE.md) — Local `.ovl` extraction pipeline guide
+- [`docs/LUA_API_MAP.md`](docs/LUA_API_MAP.md) — Engine Lua & UI API reference and local `.ovl` extraction guide
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — Contribution rules and build/test steps
 
 ## License

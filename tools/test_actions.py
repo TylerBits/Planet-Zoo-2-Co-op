@@ -36,6 +36,9 @@ local bPressedB = false
 local bMoveKeyDown = false
 local nearbySpatialHits = {}
 local partResourceNames = {}
+local entityPosMap = {}
+local playerPos = {10, 0, 10}
+local playerYaw = 0
 local tWorldAPIs = {
   ModeHelperComponent = {GetCurrentModeName = function() return uiMode end},
   InputManager = {
@@ -57,10 +60,16 @@ local tWorldAPIs = {
   spatial = {Flag_Scenery = 1, Flag_Exhibit = 2, Flag_HabitatBoundary = 4, SphereQuery = function() return nearbySpatialHits end},
   placement = {GetPartResourceName = function(_, id) return partResourceNames[id] end},
   transform = {HasTransform = function() return true end, SetTransform = function() end, SetPosition = function() end,
-    CalculateWorldTransform = function() return {GetPos = function() return vec(10, 0, 11) end, GetOr = function() return {ToYawPitchRoll = function() return vec(0, 0, 0) end} end} end},
+    CalculateWorldTransform = function(_, id)
+      local p = entityPosMap[id] or {10, 0, 11, 0}
+      return {
+        GetPos = function() return vec(p[1], p[2], p[3]) end,
+        GetOr = function() return {ToYawPitchRoll = function() return vec(p[4] or 0, 0, 0) end} end,
+      }
+    end},
   CameraModeManager = {
     GetCurrentModeName = function() return "Walking" end,
-    GetPosYPRZoom = function() return vec(10, 1.55, 10), vec(0, 0, 0), 1 end,
+    GetPosYPRZoom = function() return vec(playerPos[1], playerPos[2] + 1.55, playerPos[3]), vec(playerYaw, 0, 0), 1 end,
     GetVoxelTerrainID = function() return 1 end,
     RequestMode = function(_, m, t) call("RequestMode", m, t) end,
   },
@@ -211,13 +220,66 @@ local bPopped = false
 for _, c in ipairs(calls) do if c.name == "Spawn" and c.args[1] == "mch_balloonpopfx_red" then bPopped = true end end
 assert(bPopped, "balloon pop VFX not spawned")
 
--- 4) 2-seat bench: friend takes slot 0 -> local player automatically takes slot 1 side-by-side!
+-- 4) 2-seat bench + full 4-phase NPC sitting (walk-up -> $SitBenchIn -> $SitBenchIdle -> $SitBenchOut -> stand):
+--    Friend takes slot 0 -> plays $SitBenchIn first, then settles into $SitBenchIdle.
 Actions.OnPacket({nType = 0x12, tData = {k = "action", op = "sit", id = "bench", x = 955, y = 0, z = 1000, yaw = 0}})
+assert(friendAnim.sOverrideSuffix == "$SitBenchIn", "friend must play $SitBenchIn first, got " .. tostring(friendAnim.sOverrideSuffix))
+for _ = 1, 24 do Actions.Update(0.1, true) end
 assert(friendAnim.sOverrideSuffix == "$SitBenchIdle", "friend seated idle mismatch: " .. tostring(friendAnim.sOverrideSuffix))
+
+-- Local player standing 1.2 m in front of bench (10.45, 0, 11.2): StartSeat picks slot 1 beside friend,
+-- walks up smoothly (NEVER teleports!), plays $SitBenchIn, transitions into $SitBenchIdle01, then on WASD
+-- plays the full $SitBenchOut get-up animation before releasing!
+playerPos = {10.45, 0, 11.2}
+playerYaw = math.pi
 assert(Actions.StartSeat("bench", 10.0, 0.0, 10.0, 0) == true)
 local aState = rawget(_G, "__PZ2CoopActionsState")
 assert(aState.tActiveSeat.slot == 1, "local player should take bench slot 1 beside friend, got " .. tostring(aState.tActiveSeat.slot))
-assert(ownAnim.sOverrideSuffix == "$SitBenchIdle01", "teen bench idle should use $SitBenchIdle01")
+assert(aState.tActiveSeat.phase == "approaching", "sitting must start by walking up, not teleporting: " .. tostring(aState.tActiveSeat.phase))
+assert(math.abs(aState.tActiveSeat.z - 11.2) < 0.01, "start of approach must NOT teleport player to seat")
+-- Step approach frames: avatar walks smoothly toward entry spot (z=10.44) with non-zero walk speed
+local bSawWalkSpeed = false
+for _ = 1, 25 do
+  Actions.Update(0.05, true)
+  if aState.tActiveSeat and aState.tActiveSeat.phase == "approaching" and (aState.tActiveSeat.nWalkSpeed or 0) > 0.5 then
+    bSawWalkSpeed = true
+  end
+  if aState.tActiveSeat and aState.tActiveSeat.phase == "entering" then break end
+end
+assert(bSawWalkSpeed, "approaching chair must drive walk locomotion speed")
+assert(aState.tActiveSeat and aState.tActiveSeat.phase == "entering",
+  "after walking up & aligning, must enter sit-down animation, got " .. tostring(aState.tActiveSeat and aState.tActiveSeat.phase))
+assert(ownAnim.sOverrideSuffix == "$SitBenchIn", "entering phase must play $SitBenchIn, got " .. tostring(ownAnim.sOverrideSuffix))
+-- Advance through full TM $SitBenchIn (1.60 s) -> transitions smoothly into teen seated idle $SitBenchIdle01
+for _ = 1, 20 do Actions.Update(0.1, true) end
+assert(aState.tActiveSeat and aState.tActiveSeat.phase == "seated",
+  "must reach seated phase after $SitBenchIn, got " .. tostring(aState.tActiveSeat and aState.tActiveSeat.phase))
+assert(ownAnim.sOverrideSuffix == "$SitBenchIdle01", "teen bench idle should use $SitBenchIdle01, got " .. tostring(ownAnim.sOverrideSuffix))
+assert(math.abs(aState.tActiveSeat.x - 10.45) < 0.02 and math.abs(aState.tActiveSeat.z - 10.0) < 0.02,
+  "seated avatar must settle onto slot 1 seat coordinates")
+-- Hold W (WASD) to stand up -> must play FULL $SitBenchOut get-up animation instead of cancelling/teleporting!
+Actions.Update(0.2, true) -- past 0.15 s seated debounce
+bMoveKeyDown = true
+Actions.Update(0.05, true)
+assert(aState.tActiveSeat ~= nil and aState.tActiveSeat.phase == "exiting",
+  "pressing WASD while seated must enter exiting phase, got " .. tostring(aState.tActiveSeat and aState.tActiveSeat.phase))
+assert(ownAnim.sOverrideSuffix == "$SitBenchOut", "exiting must play $SitBenchOut, got " .. tostring(ownAnim.sOverrideSuffix))
+-- Mid-way through get-up while STILL holding W: $SitBenchOut must keep playing (not cancelled!)
+Actions.Update(0.4, true)
+assert(aState.tActiveSeat ~= nil and aState.tActiveSeat.phase == "exiting" and ownAnim.sOverrideSuffix == "$SitBenchOut",
+  "holding W mid get-up must NOT cancel $SitBenchOut")
+-- Finish full TM $SitBenchOut (1.27 s) -> cleanly released onto standing spot in front of bench!
+for _ = 1, 12 do Actions.Update(0.1, true) end
+bMoveKeyDown = false
+assert(aState.tActiveSeat == nil and pState.tSeatOverride == nil, "after $SitBenchOut finishes, seat override must clear")
+assert(ownAnim.sOverrideSuffix == nil, "base override must clear back to locomotion after standing up")
+-- Friend receives clear -> plays $SitBenchOut, then clears cleanly
+Actions.OnPacket({nType = 0x12, tData = {k = "action", op = "clear"}})
+assert(friendAnim.sOverrideSuffix == "$SitBenchOut", "friend stand-up must play $SitBenchOut, got " .. tostring(friendAnim.sOverrideSuffix))
+for _ = 1, 18 do Actions.Update(0.1, true) end
+assert(aState.tFriendSeat == nil and friendAnim.sOverrideSuffix == nil, "friend seat must clear after $SitBenchOut")
+playerPos = {10, 0, 10}
+playerYaw = 0
 
 -- 5) Automatic umbrella in rain/snow is REMOVED; manual umbrella via prop wheel still works
 Actions.Reset()
@@ -268,11 +330,214 @@ assert(aState.sExhibitIdleKind == nil and ownAnim.sOverrideSuffix == nil, "movin
 nearbySpatialHits = {}
 partResourceNames = {}
 
--- 6) Trust boundary: untrusted peer emote/prop IDs rejected cleanly
+-- 5c) Chair/bench PathExtra detection via EntityIDToPlacementID + tooltip rendering + E to sit
+tWorldAPIs.spatial.Flag_PathExtra = 8
+tWorldAPIs.spatial.Flag_Facility = 16
+tWorldAPIs.spatial.Flag_NonStaticScenery = 32
+tWorldAPIs.scenery_puppets = {
+  EntityIDToPlacementID = function(_, ent) return ent == 880 and 9901 or nil end,
+}
+tWorldAPIs.transform.GetParent = function(_, ent) return ent == 881 and 880 or nil end
+tWorldAPIs.camera = {
+  GetMainCameraID = function() return 1 end,
+  GetTopDownScreenUVFromWorldPosition = function() return vec(0.5, 0.5, 0) end,
+}
+local lastTooltip = nil
+local origGetScript = api.world.GetScript
+api.world.GetScript = function()
+  return {
+    tEnvironment = {RequireInterface = function() return {
+      SetBillboardWidgetUIInfo = function() end, SetBillboardWidgetData = function() end, ClearBillboardWidgetData = function() end,
+    } end},
+    GetHUD = function() return {
+      ShowHelperTooltip = function(_, t) lastTooltip = t end,
+      HideHelperTooltip = function() lastTooltip = nil end,
+    } end,
+  }
+end
+nearbySpatialHits = {881} -- child entity whose parent 880 maps to part 9901 ("Wooden_Chair_01")
+partResourceNames = {[9901] = "Wooden_Chair_01"}
+-- Close-range popup gating: chair 2.6 m away must NOT show Sit popup; chair behind player at 1.2 m must NOT show popup!
+entityPosMap[881] = {10, 0, 12.6, 0}
+Actions.Reset()
+Actions.Install()
+Actions.Update(0.2, true)
+assert(aState.tHovered == nil and lastTooltip == nil, "chair 2.6 m away must NOT show Sit popup")
+entityPosMap[881] = {10, 0, 8.8, 0} -- 1.2 m directly behind camera facing +Z
+Actions.Update(0.2, true)
+assert(aState.tHovered == nil and lastTooltip == nil, "chair behind player at 1.2 m must NOT show Sit popup")
+-- Non-seat false positive ("EA_PicnicCanopy") right in front at 1.0 m must NOT show Sit popup
+entityPosMap[881] = {10, 0, 11.0, 0}
+partResourceNames = {[9901] = "EA_PicnicCanopy"}
+Actions.Update(0.2, true)
+assert(aState.tHovered == nil and lastTooltip == nil, "EA_PicnicCanopy must NOT trigger Sit popup")
+-- Chair close in front at 1.0 m -> shows [E] Sit tooltip!
+partResourceNames = {[9901] = "Wooden_Chair_01"}
+Actions.Update(0.2, true)
+assert(aState.tHovered ~= nil and aState.tHovered.kind == "chair" and aState.tHovered.label == "Sit",
+  "chair via EntityIDToPlacementID parent lookup not detected: " .. tostring(aState.tHovered and aState.tHovered.kind))
+assert(lastTooltip ~= nil and lastTooltip.value == "[STRING_LITERAL:Value=|Sit|]",
+  "chair Sit tooltip not shown: " .. tostring(lastTooltip and lastTooltip.value))
+-- Press E (GameCamera_EnterVehicle) -> begins smooth walk-up (approaching) and hides Sit tooltip while walking!
+local origKeyPressed = tWorldAPIs.InputManager.GetKeyPressed
+tWorldAPIs.InputManager.GetKeyPressed = function(_, s) return s == "GameCamera_EnterVehicle" end
+Actions.Update(0.05, true)
+tWorldAPIs.InputManager.GetKeyPressed = origKeyPressed
+assert(aState.tActiveSeat ~= nil and aState.tActiveSeat.kind == "chair" and aState.tActiveSeat.phase == "approaching",
+  "pressing E must start walking up to hovered chair, got " .. tostring(aState.tActiveSeat and aState.tActiveSeat.phase))
+assert(lastTooltip == nil, "tooltip must hide while walking up to chair")
+api.world.GetScript = origGetScript
+nearbySpatialHits = {}
+partResourceNames = {}
+entityPosMap = {}
+
+-- 6) Trust boundary: untrusted peer emote/prop IDs rejected cleanly, and removed holdhands is ignored
 calls = {}
 assert(Actions.OnPacket({nType = 0x12, tData = {k = "action", op = "emote", id = "../evil_clip"}}) == true)
 assert(Actions.OnPacket({nType = 0x12, tData = {k = "action", op = "prop", id = "evil_prefab"}}) == true)
+assert(Actions.OnPacket({nType = 0x12, tData = {k = "action", op = "holdhands", on = true}}) == true)
 assert(count("QueueOneShot") == 0 and count("Spawn") == 0, "untrusted action IDs must be dropped")
+local _, _, tCatInt = Actions.GetCatalog()
+assert(tCatInt.holdhands == nil, "holdhands interaction must be removed")
+pState.tFriend = {x = 10.2, y = 0, z = 10.2, yaw = 0, m = 2}
+Actions.Update(0.2, true)
+assert(aState.tHovered == nil, "standing next to friend must NOT show Hold Hands prompt")
+pState.tFriend = nil
+
+-- 7) Universal doors, paired double doors, shutters, wide transport gates, GlassTunnelGate & AquariumEntrance exclusion
+do
+  local setTransforms = {}
+  local mgVars = {}
+  local gateRequests = {}
+  local origSetTr = tWorldAPIs.transform.SetTransform
+  tWorldAPIs.transform.SetTransform = function(_, id, tr) setTransforms[id] = tr end
+  tWorldAPIs.motiongraph = {SetVariable = function(_, id, k, v) mgVars[id] = {k = k, v = v} end}
+  tWorldAPIs.attractions = {
+    RequestHabitatGateOpen = function(_, id) gateRequests[id] = true end,
+    ReleaseHabitatGateOpenRequest = function(_, id) gateRequests[id] = false end,
+  }
+  local boundaryProps = {
+    [9101] = {GetAllData = function() return {nEntityID = 9101, sPropType = "TrackAirlock"} end},
+    [9102] = {GetAllData = function() return {nEntityID = 9102, sPropType = "AquariumEntrance"} end},
+    [9103] = {GetAllData = function() return {nEntityID = 9103, sPropType = "GlassTunnelGate"} end},
+  }
+  tWorldAPIs.habitatboundary = {
+    GetBoundaryObjectFromEntity = function(_, e)
+      return boundaryProps[e] ~= nil, nil, nil, boundaryProps[e]
+    end,
+  }
+
+  -- 7a) Single scenery door (PL_Door_01): hovered with "Open Door", toggles open via SetTransform + portal + 0x12 sync
+  Actions.Reset()
+  Actions.Install()
+  playerPos = {10, 0, 10}
+  playerYaw = 0
+  nearbySpatialHits = {9001}
+  partResourceNames = {[9001] = "PL_Door_01"}
+  entityPosMap = {[9001] = {10, 0, 11.2, 0}}
+  packets = {}
+  Actions.Update(0.2, true)
+  assert(aState.tHovered ~= nil and aState.tHovered.kind == "door" and aState.tHovered.label == "Open Door",
+    "PL_Door_01 must hover with Open Door, got " .. tostring(aState.tHovered and aState.tHovered.label))
+  -- Closed door blocks cutout check!
+  assert(pState.fnHasClosedDoorAt(10, 0, 11.2) == true, "closed PL_Door_01 must report closed door at cutout")
+  assert(Actions.TriggerInteraction(aState.tHovered) == true)
+  assert(pState.tOpenPortals["door_9001"] ~= nil, "opening PL_Door_01 must register pass-through portal")
+  assert(pState.fnHasClosedDoorAt(10, 0, 11.2) == false, "opened PL_Door_01 must clear closed-door cutout guard")
+  assert(#packets >= 1 and packets[#packets].d.op == "door" and packets[#packets].d.open == true and packets[#packets].d.kind == "scenery_door",
+    "opening PL_Door_01 must broadcast 0x12 op=door packet")
+  for _ = 1, 10 do Actions.Update(0.05, true) end
+  assert(setTransforms[9001] ~= nil, "opening PL_Door_01 must animate transform")
+  -- Close door again: restores transform and clears portal
+  Actions.Update(0.2, true)
+  assert(aState.tHovered ~= nil and aState.tHovered.label == "Close Door", "opened door must show Close Door")
+  assert(Actions.TriggerInteraction(aState.tHovered) == true)
+  for _ = 1, 12 do Actions.Update(0.05, true) end
+  assert(pState.tOpenPortals["door_9001"] == nil, "closing PL_Door_01 must clear pass-through portal")
+
+  -- 7b) Paired double scenery doors (EA_Door_01 + EA_Door_01 side-by-side 1.1 m apart): opens BOTH together!
+  setTransforms = {}
+  nearbySpatialHits = {9010, 9011}
+  partResourceNames = {[9010] = "EA_Door_01", [9011] = "EA_Door_01"}
+  entityPosMap = {[9010] = {9.45, 0, 11.2, 0}, [9011] = {10.55, 0, 11.2, 0}}
+  Actions.Update(0.2, true)
+  assert(aState.tHovered ~= nil and aState.tHovered.kind == "door")
+  assert(Actions.TriggerInteraction(aState.tHovered) == true)
+  for _ = 1, 10 do Actions.Update(0.05, true) end
+  assert(setTransforms[9010] ~= nil and setTransforms[9011] ~= nil, "paired double door must swing BOTH leaves")
+  local dblPortal = pState.tOpenPortals["door_9010"] or pState.tOpenPortals["door_9011"]
+  assert(dblPortal ~= nil and dblPortal.nHalfW >= 1.2, "paired double door must register wide combined portal")
+  Actions.Reset()
+  Actions.Install()
+
+  -- 7c) Rolling shutter (PL_Door_Shutter_01_Closed) slides upward; non-leaf frame (PL_Door_01_Frame_Single) never prompts
+  setTransforms = {}
+  nearbySpatialHits = {9020}
+  partResourceNames = {[9020] = "PL_Door_01_Frame_Single"}
+  entityPosMap = {[9020] = {10, 0, 11.0, 0}}
+  Actions.Update(0.2, true)
+  assert(aState.tHovered == nil, "door frame must NOT prompt Open Door")
+  nearbySpatialHits = {9021}
+  partResourceNames = {[9021] = "PL_Door_Shutter_01_Closed"}
+  entityPosMap = {[9021] = {10, 0, 11.2, 0}}
+  Actions.Update(0.2, true)
+  assert(aState.tHovered ~= nil and aState.tHovered.sStyle == "shutter", "shutter must be detected as shutter")
+  assert(Actions.TriggerInteraction(aState.tHovered) == true)
+  for _ = 1, 10 do Actions.Update(0.05, true) end
+  assert(setTransforms[9021] ~= nil, "shutter must slide upward via SetTransform")
+  Actions.Reset()
+  Actions.Install()
+
+  -- 7d) Wide TrackAirlock (9101), GlassTunnelGate (9103), and excluded AquariumEntrance (9102)
+  nearbySpatialHits = {9102}
+  partResourceNames = {}
+  entityPosMap = {[9102] = {10, 0, 11.2, 0}}
+  Actions.Update(0.2, true)
+  assert(aState.tHovered == nil, "AquariumEntrance staff door must NEVER prompt")
+  -- Remote packet targeting AquariumEntrance must be rejected at trust boundary
+  gateRequests = {}
+  Actions.OnPacket({nType = 0x12, tData = {k = "action", op = "door", open = true, kind = "gate", x = 1000, y = 0, z = 1120}})
+  assert(gateRequests[9102] == nil, "remote op=door must NEVER open AquariumEntrance")
+
+  -- Wide TrackAirlock (9101): opens with GateOpen=true and wide halfW=2.50
+  nearbySpatialHits = {9101}
+  entityPosMap = {[9101] = {10, 0, 12.4, 0}}
+  Actions.Update(0.2, true)
+  assert(aState.tHovered ~= nil and aState.tHovered.kind == "wide_gate" and aState.tHovered.label == "Open Gate",
+    "TrackAirlock must hover as wide_gate, got " .. tostring(aState.tHovered and aState.tHovered.kind))
+  assert(Actions.TriggerInteraction(aState.tHovered) == true)
+  assert(gateRequests[9101] == true and mgVars[9101] ~= nil and mgVars[9101].k == "GateOpen" and mgVars[9101].v == true,
+    "TrackAirlock must request gate open and set MotionGraph GateOpen=true")
+  assert(pState.tOpenPortals["door_9101"] ~= nil and pState.tOpenPortals["door_9101"].nHalfW >= 2.4,
+    "TrackAirlock must register wide pass-through portal")
+
+  -- GlassTunnelGate (9103): allowed & sets bAllowAcrylic=true
+  nearbySpatialHits = {9103}
+  entityPosMap = {[9103] = {10, 0, 11.5, 0}}
+  Actions.Update(0.2, true)
+  assert(aState.tHovered ~= nil and aState.tHovered.kind == "gate" and aState.tHovered.bAllowAcrylic == true,
+    "GlassTunnelGate must be interactive with bAllowAcrylic=true")
+  assert(Actions.TriggerInteraction(aState.tHovered) == true)
+  assert(pState.tOpenPortals["door_9103"] ~= nil and pState.tOpenPortals["door_9103"].bAllowAcrylic == true,
+    "GlassTunnelGate portal must allow passing Acrylic wall")
+
+  -- 7e) Remote friend op=door sync opens a local scenery door and registers portal
+  Actions.Reset()
+  Actions.Install()
+  nearbySpatialHits = {9050}
+  partResourceNames = {[9050] = "NO_Door_01"}
+  entityPosMap = {[9050] = {15, 0, 15, 0}}
+  Actions.OnPacket({nType = 0x12, tData = {k = "action", op = "door", open = true, kind = "scenery_door", x = 1500, y = 0, z = 1500}})
+  assert(pState.tOpenPortals["door_9050"] ~= nil, "remote op=door must open local scenery door and register portal")
+
+  tWorldAPIs.transform.SetTransform = origSetTr
+  tWorldAPIs.motiongraph = nil
+  tWorldAPIs.attractions = nil
+  tWorldAPIs.habitatboundary = nil
+  nearbySpatialHits = {}
+  partResourceNames = {}
+  entityPosMap = {}
+end
 
 return "ok: AAA locomotion & player actions"
 """

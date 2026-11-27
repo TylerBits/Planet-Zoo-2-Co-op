@@ -252,7 +252,8 @@ export const CoopMenu = Focusable.decorate(class CoopMenu extends preact.Compone
                     preact.h("div", { className: 'CoopMenu_error' }, ERRORS[s.error] ?? `Something went wrong (${s.error}).`),
                 !inSession && this.renderLobby(s),
                 s.role === 'host' && this.renderHost(s),
-                s.role === 'client' && this.renderClient(s)),
+                s.role === 'client' && this.renderClient(s),
+                s.hasVehicle && this.renderVehicleTools(s)),
             inSession &&
                 preact.h("div", { className: 'CoopMenu_footer' },
                     preact.h(Button, { icon: ICON.leave, label: literal(s.role === 'host' ? 'Close room' : 'Leave Co-op'), modifiers: 'stretch negative center', onSelect: () => this.send('leave') }))));
@@ -416,5 +417,14 @@ export const CoopMenu = Focusable.decorate(class CoopMenu extends preact.Compone
                 ? 'Jump camera flies your build camera to your friend; Walk beside lands on foot next to them.'
                 : 'Waiting for your friend\'s position...'),
             preact.h("div", { className: 'CoopMenu_hint' }, 'On foot, press C to switch between first and third person.'));
+    }
+    renderVehicleTools(s) {
+        return preact.h("div", { key: 'vehicleTools', className: 'CoopMenu_section' },
+            preact.h(Divider, null),
+            preact.h("div", { className: 'CoopMenu_sectionTitle' }, 'Research Vehicle'),
+            preact.h("div", { className: 'CoopMenu_segmented' },
+                preact.h(Button, { rootClassName: 'CoopMenu_segment', label: literal('Call vehicle nearby'), modifiers: 'stretch center', onSelect: () => this.send('vrecall') }),
+                preact.h(Button, { rootClassName: 'CoopMenu_segment', label: literal('Return to Outpost'), modifiers: 'stretch center white', onSelect: () => this.send('vrecall', 'outpost') })),
+            preact.h("div", { className: 'CoopMenu_hint' }, 'Inside the vehicle: Q (or D-Pad Up) swaps seats, L toggles headlights, C switches camera, F opens Photo Mode.'));
     }
 });

@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import time
@@ -64,6 +65,17 @@ def main() -> int:
     dumps_before = list_dumps()
 
     coop_dir.mkdir(parents=True, exist_ok=True)
+    if args.plan == "mirror_place":
+        # Fixtures are the player's own blueprints saved by the mod (never in git). Copied once to fixed names
+        # so the mod's clip_/path_ slot recycling cannot overwrite them.
+        for fixture, sources in (("test_path.bin", ("path_6.bin",)), ("test_aquarium.bin", ("clip_12.bin",))):
+            target = coop_dir / fixture
+            if not target.is_file():
+                src = next((coop_dir / n for n in sources if (coop_dir / n).is_file()), None)
+                if src is None:
+                    sys.exit(f"[live_test] fixture {fixture} missing and no source ({', '.join(sources)}) to copy")
+                shutil.copyfile(src, target)
+                print(f"[live_test] fixture {fixture} <- {src.name}")
     # Record existing diag.log mtime so we know when the new launch opens a fresh log
     old_mtime = diag_log.stat().st_mtime if diag_log.is_file() else 0.0
     (coop_dir / "autotest.txt").write_text(args.plan, encoding="utf-8")

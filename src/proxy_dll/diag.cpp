@@ -6,6 +6,7 @@
 #include <share.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -256,6 +257,8 @@ void patchImport(HMODULE module, const char* dll, const char* function, Fn hook,
                 if (original == nullptr) {
                     original = reinterpret_cast<Fn>(slots->u1.Function);
                 }
+                // Keep the store above ordered before the slot switch: game threads may call through it now.
+                std::atomic_thread_fence(std::memory_order_release);
                 slots->u1.Function = reinterpret_cast<ULONG_PTR>(hook);
                 VirtualProtect(&slots->u1.Function, sizeof(slots->u1.Function), oldProtect, &oldProtect);
             }
@@ -323,10 +326,8 @@ void diagLog(std::string_view text) {
     writeLine(L"LOG ", widen(std::string(text).c_str()).c_str());
 }
 
-void* patchExeImport(const char* dll, const char* function, void* hook) {
-    void* original = nullptr;
+void patchExeImport(const char* dll, const char* function, void* hook, void*& original) {
     patchImport(GetModuleHandleW(nullptr), dll, function, hook, original);
-    return original;
 }
 
 void startDiagnosticScan() {
