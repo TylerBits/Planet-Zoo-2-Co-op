@@ -61,8 +61,11 @@ def stale_cache() -> bool:
 
 
 def run(cmd: list) -> None:
-    if subprocess.run([str(c) for c in cmd], cwd=REPO).returncode != 0:
-        sys.exit(f"[build_dll] failed: {' '.join(str(c) for c in cmd)}")
+    # Output is kept quiet (it floods agent context); on failure the last 60 lines are shown.
+    res = subprocess.run([str(c) for c in cmd], cwd=REPO, capture_output=True, text=True, errors="replace")
+    if res.returncode != 0:
+        tail = (res.stdout + res.stderr).strip().splitlines()[-60:]
+        sys.exit("\n".join(tail) + f"\n[build_dll] failed: {' '.join(str(c) for c in cmd)}")
 
 
 def main() -> int:
