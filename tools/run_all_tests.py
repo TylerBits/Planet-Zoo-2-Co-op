@@ -9,9 +9,13 @@ Runs every offline verification check in one command with zero human interventio
      staffsync, notifications, two-peer E2E wire simulator)
   5. Headless Node.js UI check (test_ui_js.mjs)
   6. Distribution & security invariants (CLAUDE.md rule 8: no Spacewar 480, no Frontier files in zip)
+  7. Verification gate (verify_gate.py, live-runner stamp/nonce/build-hash checks, fixture chunk parser)
+
+--quiet prints only failing checks (with their output) and one final line: PASS: N/N or FAIL: K/N.
 """
 from __future__ import annotations
 
+import argparse
 import pathlib
 import re
 import shutil
@@ -54,14 +58,19 @@ def check_invariants() -> tuple[bool, str]:
     return True, "release & security invariants clean"
 
 
-def run_cmd(cmd: list[str]) -> tuple[bool, str]:
+def run_cmd(cmd: list[str], full: bool = False) -> tuple[bool, str]:
     res = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     out = (res.stdout.strip() or res.stderr.strip()).splitlines()
+    if full and res.returncode != 0:
+        return False, "\n".join((res.stdout.strip() + "\n" + res.stderr.strip()).strip().splitlines()[-40:])
     summary = out[-1] if out else f"exit {res.returncode}"
     return res.returncode == 0, summary
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Offline test & invariant runner")
+    parser.add_argument("--quiet", action="store_true", help="only failures plus one summary line")
+    quiet = parser.parse_args().quiet
     t0 = time.monotonic()
     py = sys.executable
     selftest = ROOT / "build" / "proxy_dll" / "Release" / "pz2coop_selftest.exe"
@@ -86,25 +95,32 @@ def main() -> int:
         ("notifications", [py, "tools/test_notifications.py"]),
         ("two-peer E2E wire", [py, "tools/test_two_peer_e2e.py"]),
         ("ui JS headless", [shutil.which("node"), "tools/test_ui_js.mjs"] if shutil.which("node") else None),
+        ("verify gate + live stamp", [py, "tools/test_verify_gate.py"]),
         ("release invariants", check_invariants),
     ]
 
-    failures = 0
+    failures = ran = 0
     for label, action in checks:
         if action is None:
-            print(f"SKIP {label:24s} (tool/binary not available)")
+            if not quiet:
+                print(f"SKIP {label:24s} (tool/binary not available)")
             continue
+        ran += 1
         try:
-            ok, msg = action() if callable(action) else run_cmd(action)
+            ok, msg = action() if callable(action) else run_cmd(action, full=quiet)
         except Exception as exc:
             ok, msg = False, str(exc)
         status = "PASS" if ok else "FAIL"
-        print(f"{status} {label:24s} {msg}")
+        if not ok or not quiet:
+            print(f"{status} {label:24s} {msg}")
         if not ok:
             failures += 1
 
     elapsed = time.monotonic() - t0
-    print(f"\n{'ALL PASSED' if failures == 0 else f'{failures} FAILED'} in {elapsed:.1f}s")
+    if quiet:
+        print(f"PASS: {ran}/{ran}" if failures == 0 else f"FAIL: {failures}/{ran}")
+    else:
+        print(f"\n{'ALL PASSED' if failures == 0 else f'{failures} FAILED'} in {elapsed:.1f}s")
     return 1 if failures else 0
 
 

@@ -6,6 +6,7 @@ then the same packets applied on the "friend's" side (shifted 50 m like solo mod
 new content placed / rebuilt. Catches runtime errors the syntax check cannot. Needs: pip install lupa.
 """
 import pathlib
+import re
 import sys
 
 import lupa
@@ -16,6 +17,24 @@ SOURCES = {
     "PZ2Coop.RegionSync": (ROOT / "src" / "ovl_mod" / "pz2coop.regionsync.lua").read_text(encoding="utf-8"),
 }
 
+
+
+def retail_flags(text: str) -> dict[str, int]:
+    """spatial.Flag_* values as documented (verified in retail) in regionsync.lua; the fakes must use these.
+    No fallback: a constant that cannot be parsed fails the test."""
+    flags = {}
+    for name in ("Flag_Path", "Flag_HabitatBoundary"):
+        m = re.search(rf"\b{name} = (\d+)\b", text)
+        if m is None:
+            raise SystemExit(f"FAIL: {name} = <int> not found in pz2coop.regionsync.lua")
+        flags[name] = int(m.group(1))
+    return flags
+
+
+FLAGS = retail_flags(SOURCES["PZ2Coop.RegionSync"])
+assert FLAGS["Flag_Path"] == 1, f"Flag_Path parsed as {FLAGS['Flag_Path']}, retail is 1"
+assert FLAGS["Flag_HabitatBoundary"] == 524288, f"Flag_HabitatBoundary parsed as {FLAGS['Flag_HabitatBoundary']}"
+
 HARNESS = r"""
 log, packets, calls = {}, {}, {}
 local function call(name, ...) table.insert(calls, {name = name, args = {...}}) end
@@ -23,7 +42,7 @@ local function vec(x, y, z)
   return {GetX = function() return x end, GetY = function() return y end, GetZ = function() return z end,
     PlusY = function(self, d) return vec(x, y + d, z) end}
 end
-FLAG_PATH, FLAG_FENCE = 4096, 8192
+FLAG_PATH, FLAG_FENCE = @FLAG_PATH@, @FLAG_FENCE@
 -- world content: path chunks 11, 12 near x=10; a fence: posts 21, 22 joined by panel 31
 local boxes = {[11] = {vec(9, 0, 0), vec(11, 0.2, 2)}, [12] = {vec(11, 0, 0), vec(13, 0.2, 2)},
   [13] = {vec(59, 0, 0), vec(61, 0.2, 2)}, [14] = {vec(61, 0, 0), vec(75, 0.2, 2)},
@@ -192,7 +211,7 @@ end
 local function lastCall(name) local r = nil for _, c in ipairs(calls) do if c.name == name then r = c end end return r end
 BuildSync.Install(function() end)
 RegionSync.Install()
-assert(has("spatial flags Path=4096 HabitatBoundary=8192"), dump())
+assert(has("spatial flags Path=" .. FLAG_PATH .. " HabitatBoundary=" .. FLAG_FENCE), dump())
 tick(60) -- past the startup window
 
 -- 1) local path edit: render-piece hits -> chunks via the selectable ancestor -> blueprint + packet
@@ -349,7 +368,9 @@ def main() -> int:
         sources[name] = text
     lua.globals().SOURCES = sources
     try:
-        result = lua.execute(HARNESS + CHECKS)
+        harness = HARNESS.replace("@FLAG_PATH@", str(FLAGS["Flag_Path"])).replace(
+            "@FLAG_FENCE@", str(FLAGS["Flag_HabitatBoundary"]))
+        result = lua.execute(harness + CHECKS)
     except lupa.LuaError as error:
         print("FAIL:", error)
         return 1

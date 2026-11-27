@@ -81,7 +81,16 @@ Autotest.Start = function(_sPlan)
     return
   end
   s.bActive = true
-  s.sPlan = tostring(_sPlan or "full")
+  -- Trigger "<plan>,run.<run_id>[,expref.<n>]" (tools/test_live_game.py): run_id is a per-run nonce, expref the
+  -- path chunk count read from the fixture file itself (never measured from the build under test).
+  local sTrigger = tostring(_sPlan or "full")
+  s.sPlan = string.match(sTrigger, "^([^,]+)") or "full"
+  s.sRunId = string.match(sTrigger, ",run%.([%w_-]+)") or "none"
+  s.nExpRef = tonumber(string.match(sTrigger, ",expref%.(%d+)") or "")
+  local bMeta, BuildMeta = pcall(require, "PZ2Coop.Build_Meta")
+  local tMeta = bMeta and type(BuildMeta) == "table" and BuildMeta or {}
+  Bridge.Log("AUTOTEST_META run_id=" .. s.sRunId .. " build_hash=" .. tostring(tMeta.BUILD_SOURCE_HASH or "none") ..
+    " test_hash=" .. tostring(tMeta.BUILD_TEST_HASH or "none") .. " plan=" .. s.sPlan)
   s.nPass = 0
   s.nFail = 0
   s.bLoadRequested = false
@@ -1985,15 +1994,36 @@ end
 -- ---- plan "mirror_place": remote path/floor + aquarium applies, own route vs open-editor route ----------
 -- Fixtures (the player's own blueprints, copied by tools/test_live_game.py, never in git):
 -- <game>\PZ2Coop\test_path.bin (path/floor chunks) and test_aquarium.bin (a prefab aquarium group).
--- Each case prints one MEASURE line. Path PASS: new pieces' bottom within 2 cm of the sent bottom (by0).
--- Aquarium PASS: applied and the apply produced terrain edits (flatten/paint), as the sender's commit does.
+-- Path cases: a reference copy is placed at P, then sent for real; loopback mirrors it 50 m east. The mirror
+-- is compared with the reference cell by cell (occupancy + bottom per 3 m cell), in whole path chunks (the
+-- unit the sender logs, RegionSync.TestPathChunks), and the reference itself against the chunk count read
+-- from the fixture file (s.nExpRef, never measured from the build under test). Boxes around the mirror, the
+-- reference, the world origin and the 2x offset must not change (stray pieces). Each case prints one MEASURE
+-- line and one compact AUTOTEST_CHECK line.
+-- mp_path_undo undoes and redoes the send through the real Ctrl+Z route (MainHUD.RequestUndoRedo as hooked by
+-- BuildSync: a journaled path edit falls through to the game's undo). Solo loopback runs sender and receiver
+-- in one game, so this exercises the sender's undo propagating to the mirror; a receiver-side undo of a
+-- partner's path needs the 2-PC test.
+-- Aquarium PASS: the final copy lands on its target; terrain edits are reported as a measurement.
 local c_nPathTolCm = 2
+local c_nMirrorDxM = 50 -- Bridge loopback offset (c_nLoopOffsetCm)
+local c_nCellM = 3
+-- Probe half size: test_path.bin spans ~38 x 34 m (the sender's grown area, diag.log 2026-11-27 run ba6867ab),
+-- wider than the 30 m area the packet names. Probes must hold the whole copy, or its own edge chunks count as
+-- missing (ref) and stray (ring). 21 m keeps the reference probe clear of the mirror's 5 m ring.
+local c_nProbeHalfM = 21
+local c_nRingM = 5
+local c_nRingGapM = 1 -- RegionSync c_nInsideTolM: the mirror's own pieces may reach this far past its area
+local c_nStablePoll = 0.5
+local c_nStableTicks = 3
+local c_nStableTimeout = 5.0
 local c_tMPCases = {
   {sName = "mp_path_own", sKind = "path"},
   {sName = "mp_path_editor", sKind = "path", bEditor = true},
   {sName = "mp_aquarium_probe", sKind = "aq", bProbe = true}, -- learns the group's real half height
   {sName = "mp_aquarium_own", sKind = "aq"},
   {sName = "mp_aquarium_editor", sKind = "aq", bEditor = true},
+  {sName = "mp_path_undo", sKind = "path", bUndo = true},
 }
 
 local GroundGrid = function(_x, _z)
@@ -2012,6 +2042,120 @@ local GridMaxDelta = function(_a, _b)
     n = math.max(n, math.abs((_b[i] or 0) - _a[i]))
   end
   return math.floor(n * 100 + 0.5)
+end
+
+local ShiftX = function(_r, _nDx)
+  return {x0 = _r.x0 + _nDx, y0 = _r.y0, z0 = _r.z0, x1 = _r.x1 + _nDx, y1 = _r.y1, z1 = _r.z1}
+end
+
+local OverlapsXZ = function(_a, _b)
+  return _a.x0 <= _b.x1 and _a.x1 >= _b.x0 and _a.z0 <= _b.z1 and _a.z1 >= _b.z0
+end
+
+local GrowXZ = function(_r, _n)
+  return {x0 = _r.x0 - _n, y0 = _r.y0, z0 = _r.z0 - _n, x1 = _r.x1 + _n, y1 = _r.y1, z1 = _r.z1 + _n}
+end
+
+-- {bPath, nBottom cm} per c_nCellM cell over _r, in a fixed order, so a copy shifted by whole metres maps
+-- cell i onto cell i.
+local PathGrid = function(_r)
+  local RegionSync = require("PZ2Coop.RegionSync")
+  local t = {}
+  local nX = math.ceil((_r.x1 - _r.x0) / c_nCellM - 1e-6)
+  local nZ = math.ceil((_r.z1 - _r.z0) / c_nCellM - 1e-6)
+  for i = 0, nX - 1 do
+    for j = 0, nZ - 1 do
+      local rCell = {x0 = _r.x0 + i * c_nCellM, x1 = math.min(_r.x0 + (i + 1) * c_nCellM, _r.x1), y0 = _r.y0, y1 = _r.y1,
+        z0 = _r.z0 + j * c_nCellM, z1 = math.min(_r.z0 + (j + 1) * c_nCellM, _r.z1)}
+      local nBottom, nHits = RegionSync.TestPathBottom(rCell)
+      table.insert(t, {bPath = nHits > 0, nBottom = nBottom})
+    end
+  end
+  return t
+end
+
+-- Cells whose occupancy differs, or whose path bottom differs by more than c_nPathTolCm; -1 = no grid.
+local GridDiff = function(_tRef, _tOther)
+  if _tRef == nil or _tOther == nil or #_tRef ~= #_tOther then
+    return -1
+  end
+  local n = 0
+  for i, a in ipairs(_tRef) do
+    local b = _tOther[i]
+    if a.bPath ~= b.bPath then
+      n = n + 1
+    elseif a.bPath and (a.nBottom == nil or b.nBottom == nil or math.abs(a.nBottom - b.nBottom) > c_nPathTolCm) then
+      n = n + 1
+    end
+  end
+  return n
+end
+
+-- Areas where applying the mirror must change nothing: a 5 m ring outside the mirror area, the reference
+-- area, and two transform-bug boxes (world origin, 2x the mirror offset) unless they touch either copy.
+local StrayBoxes = function(_rRef, _rMirror)
+  local o = GrowXZ(_rMirror, c_nRingM)
+  local y0, y1 = _rMirror.y0 - c_nRingM, _rMirror.y1 + c_nRingM
+  local g = c_nRingGapM
+  local t = {
+    {x0 = o.x0, x1 = _rMirror.x0 - g, z0 = o.z0, z1 = o.z1, y0 = y0, y1 = y1},
+    {x0 = _rMirror.x1 + g, x1 = o.x1, z0 = o.z0, z1 = o.z1, y0 = y0, y1 = y1},
+    {x0 = _rMirror.x0 - g, x1 = _rMirror.x1 + g, z0 = o.z0, z1 = _rMirror.z0 - g, y0 = y0, y1 = y1},
+    {x0 = _rMirror.x0 - g, x1 = _rMirror.x1 + g, z0 = _rMirror.z1 + g, z1 = o.z1, y0 = y0, y1 = y1},
+    _rRef,
+  }
+  local rFar = ShiftX(_rRef, 2 * c_nMirrorDxM)
+  rFar.y0, rFar.y1 = rFar.y0 - 20, rFar.y1 + 20
+  local rOrigin = {x0 = -15, x1 = 15, z0 = -15, z1 = 15, y0 = -200, y1 = 400}
+  for _, r in ipairs({rFar, rOrigin}) do
+    if not OverlapsXZ(r, GrowXZ(_rRef, c_nRingM)) and not OverlapsXZ(r, o) then
+      table.insert(t, r)
+    end
+  end
+  return t
+end
+
+local StrayCounts = function(_tBoxes)
+  local RegionSync = require("PZ2Coop.RegionSync")
+  local t = {}
+  for i, r in ipairs(_tBoxes) do
+    local _, nHits = RegionSync.TestPathBottom(r)
+    t[i] = nHits
+  end
+  return t
+end
+
+local StrayDelta = function(_tBase, _tNow)
+  local n = 0
+  for i, nBase in ipairs(_tBase) do
+    n = n + math.abs((_tNow[i] or 0) - nBase)
+  end
+  return n
+end
+
+-- Mirror state: whole chunks, piece hits, lowest bottom (cm), cell diff against the reference, stray delta.
+local MeasureMirror = function(_c)
+  local RegionSync = require("PZ2Coop.RegionSync")
+  local nBottom, nHits = RegionSync.TestPathBottom(_c.rMirror)
+  return {nChunks = RegionSync.TestPathChunks(_c.rMirror), nHits = nHits, nBottom = nBottom,
+    nDiff = GridDiff(_c.tRefGrid, PathGrid(_c.rMirror)), nStray = StrayDelta(_c.tStray0, StrayCounts(_c.tStrayBoxes))}
+end
+
+local MirrorSignature = function(_c)
+  local RegionSync = require("PZ2Coop.RegionSync")
+  local _, nHits = RegionSync.TestPathBottom(_c.rMirror)
+  return tostring(RegionSync.TestPathChunks(_c.rMirror)) .. "/" .. nHits .. "/" .. s.mp.nTerrainEdits .. "/" ..
+    s.mp.nVoxelChanges
+end
+
+-- The player's Ctrl+Z / Ctrl+Y: MainHUD.RequestUndoRedo only reads self.ModeHelperComponentAPI
+-- (windows.mainhud.lua), and BuildSync wraps it with the co-op undo (BuildSync.HandleUndoRedo).
+local RequestUndoRedo = function(_bUndo)
+  local bReq, MainHUD = pcall(require, "Windows.MainHUD")
+  if not bReq or type(MainHUD) ~= "table" or rawget(MainHUD, "__PZ2CoopUndoHook") == nil then
+    return false, "Ctrl+Z hook not installed"
+  end
+  return pcall(MainHUD.RequestUndoRedo, {ModeHelperComponentAPI = api.world.GetWorldAPIs().ModeHelperComponent}, _bUndo)
 end
 
 local AppliedGroups = function()
@@ -2046,18 +2190,96 @@ local StepMPSetup = function()
   pcall(function() api.messaging.RegisterReceiver(api.messaging.MsgType_TerrainEditStatsMessage, s.mp.fnTerrain) end)
   pcall(function() api.messaging.RegisterReceiver(api.messaging.MsgType_SpatialVolumeChangedMessage, s.mp.fnVolume) end)
   Bridge.SetLoopback(false)
-  Log(string.format("mirror_place: base (%.1f,%.1f)", s.mp.cx, s.mp.cz))
+  Log(string.format("mirror_place: base (%.1f,%.1f) expRef=%s", s.mp.cx, s.mp.cz, tostring(s.nExpRef)))
   SetStage("mp_case")
 end
 
-local FinishMPCase = function(_bPass, _sDetail)
+local FinishMPCase = function(_bPass, _sDetail, _sMeasure)
   local mp = s.mp
   rawset(global, "PZ2COOP_FORCE_EDITOR", nil)
   Bridge.SetLoopback(false)
   CloseTool()
-  Bridge.Log("MEASURE " .. mp.case.sName .. " " .. _sDetail)
+  Bridge.Log("MEASURE " .. mp.case.sName .. " " .. (_sMeasure or _sDetail))
   Record(mp.case.sName, _bPass, _sDetail)
   mp.case = nil
+end
+
+local ResetCaseClock = function(_c)
+  _c.nT, _c.nT0 = 0, s.nStageTime
+end
+
+local StartUndoRedo = function(_c, _bUndo)
+  ResetCaseClock(_c)
+  _c.sSig0 = MirrorSignature(_c)
+  _c.sLastSig, _c.nSame, _c.bChanged, _c.nNextPoll = _c.sSig0, 0, false, c_nStablePoll
+  local bOk, sErr = RequestUndoRedo(_bUndo)
+  if not bOk then
+    _c.sUndoErr = (_bUndo and "undo: " or "redo: ") .. tostring(sErr)
+  end
+end
+
+local FinishPathUndoCase = function(_c)
+  local f, u, r = _c.tFirst, _c.tUndo, _c.tRedo
+  local bRefOk = s.nExpRef ~= nil and _c.nRefChunks == s.nExpRef
+  local bEmpty0 = _c.nMirHits0 == 0 and _c.nMirChunks0 == 0
+  local bApply = f.nChunks == _c.nRefChunks and f.nDiff == 0 and f.nStray == 0
+  local bUndo = u.nHits == 0 and u.nChunks == 0 and u.nStray == 0 and u.nGroundCm <= c_nPathTolCm
+  local bRedo = r.nChunks == _c.nRefChunks and r.nDiff == 0 and r.nStray == 0
+  local sDetail = string.format("undoHits=%d redoHits=%d redoDiff=%d strayAfterUndo=%d gridMaxDeltaCm=%d " ..
+    "expRef=%s ref=%s apply=%s applyDiff=%d undoChunks=%s redoChunks=%s strayAfterRedo=%d mirror0=%d",
+    u.nHits, r.nHits, r.nDiff, u.nStray, u.nGroundCm, tostring(s.nExpRef), tostring(_c.nRefChunks),
+    tostring(f.nChunks), f.nDiff, tostring(u.nChunks), tostring(r.nChunks), r.nStray, _c.nMirHits0)
+  local sMeasure = sDetail .. string.format(" applyStray=%d undoTimeout=%s redoTimeout=%s err=%s",
+    f.nStray, tostring(u.bTimeout), tostring(r.bTimeout), tostring(_c.sUndoErr))
+  FinishMPCase(bRefOk and bEmpty0 and bApply and bUndo and bRedo and _c.sUndoErr == nil, sDetail, sMeasure)
+end
+
+-- Bounded stability poll after undo/redo: the mirror's chunks, hits and terrain counters changed and then
+-- stayed the same for c_nStableTicks polls, or c_nStableTimeout passed.
+local StepPathUndoRedo = function(_c)
+  if _c.nT < _c.nNextPoll then
+    return
+  end
+  _c.nNextPoll = _c.nT + c_nStablePoll
+  local sSig = MirrorSignature(_c)
+  _c.bChanged = _c.bChanged or sSig ~= _c.sSig0
+  _c.nSame = sSig == _c.sLastSig and _c.nSame + 1 or 0
+  _c.sLastSig = sSig
+  local bStable = _c.bChanged and _c.nSame >= c_nStableTicks
+  if not bStable and _c.nT < c_nStableTimeout then
+    return
+  end
+  local tNow = MeasureMirror(_c)
+  tNow.bTimeout = not bStable
+  if _c.sPhase == "undo" then
+    tNow.nGroundCm = GridMaxDelta(_c.tMirGround0, GroundGrid(_c.x + c_nMirrorDxM, _c.z))
+    _c.tUndo = tNow
+    _c.sPhase = "redo"
+    StartUndoRedo(_c, false)
+    return
+  end
+  _c.tRedo = tNow
+  FinishPathUndoCase(_c)
+end
+
+local FinishPathCase = function(_c, _tRe)
+  local mp = s.mp
+  local f, r = _c.tFirst, _tRe
+  local nDy = (r.nBottom ~= nil and _c.nRefBottom ~= nil) and (r.nBottom - _c.nRefBottom) or nil
+  local nDup = math.max(0, math.max(f.nChunks or 0, r.nChunks or 0) - (_c.nRefChunks or 0))
+  local nCellDiff = (f.nDiff < 0 or r.nDiff < 0) and -1 or math.max(f.nDiff, r.nDiff)
+  local nStray = math.max(f.nStray, r.nStray)
+  -- First placement must land: a corrective re-place leaves the first copy's terrain flatten behind.
+  local bPass = s.nExpRef ~= nil and _c.nRefChunks == s.nExpRef and f.nChunks == _c.nRefChunks and
+    r.nChunks == _c.nRefChunks and f.nDiff == 0 and r.nDiff == 0 and nStray == 0 and r.nHits == f.nHits and
+    nDy ~= nil and math.abs(nDy) <= c_nPathTolCm and _c.nFirstDy ~= nil and math.abs(_c.nFirstDy) <= c_nPathTolCm
+  local sDetail = string.format("expRef=%s ref=%s mir=%s resend=%s cellDiff=%d dup=%d stray=%d firstDy=%s dy=%s",
+    tostring(s.nExpRef), tostring(_c.nRefChunks), tostring(f.nChunks), tostring(r.nChunks), nCellDiff, nDup, nStray,
+    tostring(_c.nFirstDy), tostring(nDy))
+  local sMeasure = sDetail .. string.format(" hits=%d->%d refBottom=%s mirBottom=%s terrainEdits=%d voxel=%d t=%.1fs",
+    f.nHits, r.nHits, tostring(_c.nRefBottom), tostring(r.nBottom), mp.nTerrainEdits - _c.nEdits0,
+    mp.nVoxelChanges - _c.nVox0, _c.nT)
+  FinishMPCase(bPass, sDetail, sMeasure)
 end
 
 local StepMPCase = function()
@@ -2073,8 +2295,8 @@ local StepMPCase = function()
       SetStage("cleanup")
       return
     end
-    -- One clean spot per case, 40 m apart along z, so cases never touch each other.
-    local x, z = mp.cx, mp.cz + 40 * mp.i
+    -- One clean spot per case, 55 m apart along z, so cases (and their probes + rings) never touch each other.
+    local x, z = mp.cx, mp.cz + 55 * mp.i
     mp.case = {sName = tCase.sName, tCase = tCase, x = x, z = z, y = RaycastGroundY(x, z, 0), sPhase = "open", nT = 0, nT0 = s.nStageTime}
     if tCase.bEditor then
       OpenPathTool()
@@ -2100,12 +2322,15 @@ local StepMPCase = function()
     if tCase.sKind == "path" then
       -- Reference copy at P (stands in for the player's own path); sent for real once it settled.
       c.rRef = {x0 = c.x - 15, y0 = c.y - 3, z0 = c.z - 15, x1 = c.x + 15, y1 = c.y + 6, z1 = c.z + 15}
+      c.rProbe = {x0 = c.x - c_nProbeHalfM, y0 = c.rRef.y0, z0 = c.z - c_nProbeHalfM, x1 = c.x + c_nProbeHalfM,
+        y1 = c.rRef.y1, z1 = c.z + c_nProbeHalfM}
+      c.rMirror = ShiftX(c.rProbe, c_nMirrorDxM)
       c.fnSetRouteFlags = SetRouteFlags
       RegionSync.OnPacket({nType = 0x22, sFile = Bridge.GetPrefix() .. "test_path.bin", tData = {
         k = "path", n = 1, cx = nX, cy = nY + 50, cz = nZ, by0 = nY,
         x0 = nX - 1500, y0 = nY - 300, z0 = nZ - 1500, x1 = nX + 1500, y1 = nY + 600, z1 = nZ + 1500}})
       c.sPhase = "ref"
-      c.nT, c.nT0 = 0, s.nStageTime
+      ResetCaseClock(c)
       return
     else
       SetRouteFlags()
@@ -2116,7 +2341,7 @@ local StepMPCase = function()
       BuildSync.TakeLastGroupBox()
     end
     c.sPhase = "wait"
-    c.nT, c.nT0 = 0, s.nStageTime
+    ResetCaseClock(c)
     return
   end
   local tCase = c.tCase
@@ -2126,17 +2351,29 @@ local StepMPCase = function()
       c.nRefAt = c.nT
     end
     if c.bRefDone and c.nT - c.nRefAt >= 1.0 then
+      -- Ground truth before anything is sent: the reference copy, the empty mirror area, the stray boxes.
+      c.nRefBottom = RegionSync.TestPathBottom(c.rProbe)
+      c.nRefChunks = RegionSync.TestPathChunks(c.rProbe)
+      c.tRefGrid = PathGrid(c.rProbe)
+      c.tStrayBoxes = StrayBoxes(c.rProbe, c.rMirror)
+      c.tStray0 = StrayCounts(c.tStrayBoxes)
+      local _, nMirHits0 = RegionSync.TestPathBottom(c.rMirror)
+      c.nMirHits0, c.nMirChunks0 = nMirHits0, RegionSync.TestPathChunks(c.rMirror)
+      c.tMirGround0 = GroundGrid(c.x + c_nMirrorDxM, c.z)
       -- Real send: the local-edit route saves the area, loopback mirrors it 50 m east through the route under test.
-      c.nRefBottom = RegionSync.TestPathBottom(c.rRef)
       c.nEdits0, c.nVox0 = mp.nTerrainEdits, mp.nVoxelChanges
       Bridge.SetLoopback(true)
       c.fnSetRouteFlags()
       RegionSync.TestSendPath(c.rRef)
       c.sPhase = "wait"
-      c.nT, c.nT0 = 0, s.nStageTime
+      ResetCaseClock(c)
     elseif c.nT >= 15.0 then
-      FinishMPCase(false, "reference path never applied")
+      FinishMPCase(false, "reference path never applied expRef=" .. tostring(s.nExpRef))
     end
+    return
+  end
+  if c.sPhase == "undo" or c.sPhase == "redo" then
+    StepPathUndoRedo(c)
     return
   end
   -- wait phase
@@ -2148,25 +2385,22 @@ local StepMPCase = function()
     end
     local nSettle = 3.0 -- room for the one height-correcting re-place
     if (c.nLastDyAt ~= nil and c.nT - c.nLastDyAt >= nSettle) or c.nT >= 20.0 then
-      local rMirror = {x0 = c.rRef.x0 + 50, y0 = c.rRef.y0, z0 = c.rRef.z0, x1 = c.rRef.x1 + 50, y1 = c.rRef.y1, z1 = c.rRef.z1}
-      local nMirBottom, nMirHits = RegionSync.TestPathBottom(rMirror)
-      if c.nHits1 == nil then
+      if c.tFirst == nil then
+        c.tFirst = MeasureMirror(c)
+        if tCase.bUndo then
+          c.sPhase = "undo"
+          StartUndoRedo(c, true)
+          return
+        end
         -- Send the same path again: the mirror now replaces its own copy (removes, then places). Gaps in the
         -- 2026-11-27 play test sat exactly where a mirror replaced its own chunks.
-        c.nHits1 = nMirHits
         c.nLastDyAt = nil
-        c.nT, c.nT0 = 0, s.nStageTime
+        ResetCaseClock(c)
         c.fnSetRouteFlags()
         RegionSync.TestSendPath(c.rRef)
         return
       end
-      local nDy = (nMirBottom ~= nil and c.nRefBottom ~= nil) and (nMirBottom - c.nRefBottom) or nil
-      Bridge.SetLoopback(false)
-      -- First placement must land: a corrective re-place leaves the first copy's terrain flatten behind.
-      local bPass = nDy ~= nil and math.abs(nDy) <= c_nPathTolCm and c.nFirstDy ~= nil and math.abs(c.nFirstDy) <= c_nPathTolCm and
-        nMirHits == c.nHits1
-      FinishMPCase(bPass, string.format("hits=%d->%d ref=%s mirror=%s dy=%s firstDy=%s terrainEdits=%d voxel=%d t=%.1fs",
-        c.nHits1, nMirHits, tostring(c.nRefBottom), tostring(nMirBottom), tostring(nDy), tostring(c.nFirstDy), mp.nTerrainEdits - c.nEdits0, mp.nVoxelChanges - c.nVox0, c.nT))
+      FinishPathCase(c, MeasureMirror(c))
     end
   else
     local bApplied = AppliedGroups() > c.nGroups0

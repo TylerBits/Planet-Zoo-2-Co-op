@@ -1538,6 +1538,14 @@ RegionSync.TestPathBottom = function(_r)
   end
   return tBox and Cm(tBox.y0) or nil, #tHits
 end
+-- Autotest: path volume chunks lying inside an area (the unit the sender logs as "N chunks"), nil on error.
+RegionSync.TestPathChunks = function(_r)
+  local nLogs = s.nLogs
+  s.nLogs = c_nLogLimit -- shortcut: mutes QueryPathChunks' log while probing; add a quiet flag if it gets callers
+  local bOk, _, tChunks = pcall(QueryPathChunks, _r, _r)
+  s.nLogs = nLogs
+  return bOk and type(tChunks) == "table" and #tChunks or nil
+end
 
 -- Autotest: last measured path bottom offset (cm) of a remote path apply, then cleared.
 RegionSync.TakeLastPathDy = function()
